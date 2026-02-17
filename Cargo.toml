@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gateway_v1",
+    "crates/sv2_core",
+]
