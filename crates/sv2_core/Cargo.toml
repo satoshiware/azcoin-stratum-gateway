@@ -1,0 +1,7 @@
+[package]
+name = "sv2_core"
+version = "0.1.2"
+edition = "2021"
+
+[dependencies]
+stratum_core = { package = "stratum-core", git = "https://github.com/stratum-mining/stratum", rev = "cac105932798a13edcb0d60ec811b8b8baa8870a" }
