@@ -9,6 +9,7 @@ use std::time::Duration;
 
 const DEFAULT_POLL_SECS: u64 = 3;
 const HTTP_TIMEOUT_SECS: u64 = 15;
+const AZ_RPC_ERR_MISSING_SEGWIT_RULES: i64 = -8;
 
 #[derive(Debug, Default)]
 pub struct TemplatePollerState {
@@ -109,7 +110,9 @@ async fn fetch_template(
         "jsonrpc": "1.0",
         "id": "gateway_v1-gbt-poller",
         "method": "getblocktemplate",
-        "params": [{}]
+        "params": [{
+            "rules": ["segwit"]
+        }]
     });
 
     let response = client
@@ -138,6 +141,12 @@ fn parse_template_response(body: &str) -> anyhow::Result<TemplateSnapshot> {
         serde_json::from_str(body).context("failed to decode AZ RPC JSON response")?;
 
     if let Some(error) = rpc.error {
+        if error.code == AZ_RPC_ERR_MISSING_SEGWIT_RULES {
+            return Err(anyhow!(
+                "AZ RPC getblocktemplate rejected request: missing segwit rules; expected params=[{{\"rules\":[\"segwit\"]}}], rpc_message={}",
+                error.message
+            ));
+        }
         return Err(anyhow!(
             "AZ RPC error code={} message={}",
             error.code,
@@ -226,6 +235,23 @@ mod tests {
         assert!(!template_changed(&Some((10, "aaa".to_string())), &template));
         assert!(template_changed(&Some((11, "aaa".to_string())), &template));
         assert!(template_changed(&Some((10, "bbb".to_string())), &template));
+    }
+
+    #[test]
+    fn parse_template_response_reports_missing_segwit_rules_error() {
+        let body = r#"{
+            "id":"gateway_v1-gbt-poller",
+            "result":null,
+            "error":{
+                "code":-8,
+                "message":"getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+            }
+        }"#;
+
+        let error = parse_template_response(body).expect_err("response should surface rpc error");
+        let message = error.to_string();
+        assert!(message.contains("missing segwit rules"));
+        assert!(message.contains(r#"params=[{"rules":["segwit"]}]"#));
     }
 
     #[test]
