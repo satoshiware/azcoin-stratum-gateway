@@ -7,20 +7,22 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod gbt;
+mod version;
+use gbt::poller::TemplatePollerState;
+
 const SUBSCRIPTION_ID: &str = "azcoin-subscription-1";
 const EXTRANONCE_1: &str = "deadbeef";
 const EXTRANONCE_2_SIZE: u64 = 4;
 
 struct GatewayState {
     sessions: AtomicU64,
-    jobs: AtomicU64,
 }
 
 impl GatewayState {
     fn new() -> Self {
         Self {
             sessions: AtomicU64::new(0),
-            jobs: AtomicU64::new(0),
         }
     }
 }
@@ -34,6 +36,18 @@ struct RpcRequest {
 
 fn main() -> io::Result<()> {
     let _ = sv2_core::sv2_foundation_ready();
+    let version = version::get_version();
+    let revision = version::get_revision();
+
+    if env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("stratum-gateway version {version} (rev {revision})");
+        return Ok(());
+    }
+
+    println!("stratum-gateway version {version} (rev {revision})");
 
     let bind_addr = env::var("GATEWAY_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3333".to_string());
     let health_log_interval_secs = env::var("HEALTH_LOG_INTERVAL_SECS")
@@ -47,8 +61,11 @@ fn main() -> io::Result<()> {
 
     let started_at = Instant::now();
     let state = Arc::new(GatewayState::new());
+    let template_state = Arc::new(TemplatePollerState::default());
+    spawn_gbt_poller(Arc::clone(&template_state));
     spawn_health_logger(
         Arc::clone(&state),
+        Arc::clone(&template_state),
         started_at,
         Duration::from_secs(health_log_interval_secs),
     );
@@ -69,13 +86,38 @@ fn main() -> io::Result<()> {
     }
 }
 
-fn spawn_health_logger(state: Arc<GatewayState>, started_at: Instant, interval: Duration) {
+fn spawn_health_logger(
+    state: Arc<GatewayState>,
+    template_state: Arc<TemplatePollerState>,
+    started_at: Instant,
+    interval: Duration,
+) {
     thread::spawn(move || loop {
         thread::sleep(interval);
         let uptime_secs = started_at.elapsed().as_secs();
         let sessions = state.sessions.load(Ordering::Relaxed);
-        let jobs = state.jobs.load(Ordering::Relaxed);
+        let jobs = template_state.current_job_counter();
         println!("HEALTH ok uptime={uptime_secs}s sessions={sessions} jobs={jobs}");
+    });
+}
+
+fn spawn_gbt_poller(shared_state: Arc<TemplatePollerState>) {
+    thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("TEMPLATE_POLLER runtime_init_failed error=\"{error}\"");
+                return;
+            }
+        };
+
+        if let Err(error) = runtime.block_on(gbt::poller::run_template_poller(shared_state)) {
+            eprintln!("TEMPLATE_POLLER exited error=\"{error}\"");
+        }
     });
 }
 

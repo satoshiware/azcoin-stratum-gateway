@@ -8,5 +8,9 @@ services:
       GATEWAY_BIND_HOST: ${GATEWAY_BIND_HOST:-0.0.0.0}
       GATEWAY_BIND_PORT: ${GATEWAY_BIND_PORT:-3333}
       HEALTH_LOG_INTERVAL_SECS: ${HEALTH_LOG_INTERVAL_SECS:-30}
+      AZ_RPC_URL: ${AZ_RPC_URL:-http://host.docker.internal:8332}
+      AZ_RPC_USER: ${AZ_RPC_USER:-azrpc}
+      AZ_RPC_PASSWORD: ${AZ_RPC_PASSWORD:-changeme}
+      AZ_GBT_POLL_SECS: ${AZ_GBT_POLL_SECS:-3}
     ports:
       - "${GATEWAY_PORT:-3333}:3333"
