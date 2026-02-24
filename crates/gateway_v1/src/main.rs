@@ -15,6 +15,8 @@ use gbt::poller::TemplatePollerState;
 const SUBSCRIPTION_ID: &str = "1";
 const EXTRANONCE_2_SIZE: u64 = 8;
 const STARTING_DIFFICULTY: u64 = 1;
+const VERSION_ROLLING_EXTENSION: &str = "version-rolling";
+const DEFAULT_VERSION_ROLLING_MASK: &str = "ffffffff";
 
 struct GatewayState {
     sessions: AtomicU64,
@@ -239,13 +241,23 @@ fn build_response(
     session_state: &mut SessionState,
 ) -> Value {
     match request.method.as_str() {
-        "mining.configure" => json!({
-            "id": request.id,
-            "result": {
-                "version-rolling": false
-            },
-            "error": Value::Null
-        }),
+        "mining.configure" => {
+            let result = match version_rolling_mask_if_requested(&request.params) {
+                Some(mask) => json!({
+                    "version-rolling": true,
+                    "version-rolling.mask": mask
+                }),
+                None => json!({
+                    "version-rolling": false
+                }),
+            };
+
+            json!({
+                "id": request.id,
+                "result": result,
+                "error": Value::Null
+            })
+        }
         "mining.subscribe" => json!({
             "id": request.id,
             "result": [
@@ -280,6 +292,30 @@ fn build_response(
             }
         }),
     }
+}
+
+fn version_rolling_mask_if_requested(params: &[Value]) -> Option<String> {
+    let requested_extensions = params.first()?.as_array()?;
+    let requested = requested_extensions.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|name| name == VERSION_ROLLING_EXTENSION)
+            .unwrap_or(false)
+    });
+
+    if !requested {
+        return None;
+    }
+
+    let mask = params
+        .get(1)
+        .and_then(Value::as_object)
+        .and_then(|options| options.get("version-rolling.mask"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_VERSION_ROLLING_MASK)
+        .to_string();
+
+    Some(mask)
 }
 
 fn build_set_difficulty_push() -> Value {
@@ -408,13 +444,13 @@ mod tests {
     }
 
     #[test]
-    fn mining_configure_returns_version_rolling_false() {
+    fn mining_configure_returns_version_rolling_mask_when_requested() {
         let request = RpcRequest {
             id: Value::from(41),
             method: "mining.configure".to_string(),
             params: vec![
                 json!(["version-rolling"]),
-                json!({"version-rolling.mask":"ffffffff"}),
+                json!({"version-rolling.mask":"1fffe000"}),
             ],
         };
         let mut session_state = SessionState::default();
@@ -425,7 +461,33 @@ mod tests {
         );
         assert_eq!(response["id"], Value::from(41));
         assert!(response["error"].is_null());
-        assert_eq!(response["result"]["version-rolling"], Value::from(false));
+        assert_eq!(response["result"]["version-rolling"], Value::from(true));
+        assert_eq!(
+            response["result"]["version-rolling.mask"],
+            Value::from("1fffe000")
+        );
+    }
+
+    #[test]
+    fn mining_configure_uses_default_mask_when_not_provided() {
+        let request = RpcRequest {
+            id: Value::from(42),
+            method: "mining.configure".to_string(),
+            params: vec![json!(["minimum-difficulty", "version-rolling"])],
+        };
+        let mut session_state = SessionState::default();
+        let response = build_response(
+            &request,
+            "127.0.0.1:12345".parse().expect("valid addr"),
+            &mut session_state,
+        );
+        assert_eq!(response["id"], Value::from(42));
+        assert!(response["error"].is_null());
+        assert_eq!(response["result"]["version-rolling"], Value::from(true));
+        assert_eq!(
+            response["result"]["version-rolling.mask"],
+            Value::from("ffffffff")
+        );
     }
 
     #[test]
