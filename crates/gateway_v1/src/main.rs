@@ -1,3 +1,4 @@
+use rand::random;
 use serde_json::{json, Value};
 use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -5,15 +6,15 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod gbt;
 mod version;
 use gbt::poller::TemplatePollerState;
 
-const SUBSCRIPTION_ID: &str = "azcoin-subscription-1";
-const EXTRANONCE_1: &str = "deadbeef";
-const EXTRANONCE_2_SIZE: u64 = 4;
+const SUBSCRIPTION_ID: &str = "1";
+const EXTRANONCE_2_SIZE: u64 = 8;
+const STARTING_DIFFICULTY: u64 = 1;
 
 struct GatewayState {
     sessions: AtomicU64,
@@ -24,6 +25,19 @@ impl GatewayState {
         Self {
             sessions: AtomicU64::new(0),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionState {
+    extranonce1_hex: Option<String>,
+}
+
+impl SessionState {
+    fn extranonce1_hex(&mut self) -> &str {
+        self.extranonce1_hex
+            .get_or_insert_with(generate_extranonce1_hex)
+            .as_str()
     }
 }
 
@@ -74,8 +88,14 @@ fn main() -> io::Result<()> {
         match listener.accept() {
             Ok((stream, remote_addr)) => {
                 let state_for_client = Arc::clone(&state);
+                let template_state_for_client = Arc::clone(&template_state);
                 thread::spawn(move || {
-                    handle_client(stream, remote_addr, state_for_client);
+                    handle_client(
+                        stream,
+                        remote_addr,
+                        state_for_client,
+                        template_state_for_client,
+                    );
                 });
             }
             Err(error) => {
@@ -121,11 +141,16 @@ fn spawn_gbt_poller(shared_state: Arc<TemplatePollerState>) {
     });
 }
 
-fn handle_client(stream: TcpStream, remote_addr: SocketAddr, state: Arc<GatewayState>) {
+fn handle_client(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    state: Arc<GatewayState>,
+    template_state: Arc<TemplatePollerState>,
+) {
     let active_sessions = state.sessions.fetch_add(1, Ordering::SeqCst) + 1;
     println!("[tcp] session_open remote_addr={remote_addr} sessions={active_sessions}");
 
-    if let Err(error) = handle_client_inner(stream, remote_addr) {
+    if let Err(error) = handle_client_inner(stream, remote_addr, template_state) {
         eprintln!("[tcp] session_error remote_addr={remote_addr} error=\"{error}\"");
     }
 
@@ -133,10 +158,15 @@ fn handle_client(stream: TcpStream, remote_addr: SocketAddr, state: Arc<GatewayS
     println!("[tcp] session_closed remote_addr={remote_addr} sessions={active_sessions}");
 }
 
-fn handle_client_inner(stream: TcpStream, remote_addr: SocketAddr) -> io::Result<()> {
+fn handle_client_inner(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    template_state: Arc<TemplatePollerState>,
+) -> io::Result<()> {
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
+    let mut session_state = SessionState::default();
     let mut line = String::new();
 
     loop {
@@ -150,11 +180,21 @@ fn handle_client_inner(stream: TcpStream, remote_addr: SocketAddr) -> io::Result
         if trimmed.is_empty() {
             continue;
         }
+        println!("STRATUM_RX remote={remote_addr} line={trimmed}");
 
         match parse_rpc_request(trimmed) {
             Ok(request) => {
-                let response = build_response(&request, remote_addr);
-                write_json_line(&mut writer, &response)?;
+                let response = build_response(&request, remote_addr, &mut session_state);
+                write_json_line(&mut writer, remote_addr, &response)?;
+
+                if request.method == "mining.authorize" {
+                    write_json_line(&mut writer, remote_addr, &build_set_difficulty_push())?;
+                    write_json_line(
+                        &mut writer,
+                        remote_addr,
+                        &build_notify_push(template_state.as_ref()),
+                    )?;
+                }
             }
             Err(error) => {
                 // Intentionally log only metadata; request bodies can contain passwords.
@@ -193,8 +233,19 @@ fn parse_rpc_request(line: &str) -> Result<RpcRequest, &'static str> {
     Ok(RpcRequest { id, method, params })
 }
 
-fn build_response(request: &RpcRequest, remote_addr: SocketAddr) -> Value {
+fn build_response(
+    request: &RpcRequest,
+    remote_addr: SocketAddr,
+    session_state: &mut SessionState,
+) -> Value {
     match request.method.as_str() {
+        "mining.configure" => json!({
+            "id": request.id,
+            "result": {
+                "version-rolling": false
+            },
+            "error": Value::Null
+        }),
         "mining.subscribe" => json!({
             "id": request.id,
             "result": [
@@ -202,7 +253,7 @@ fn build_response(request: &RpcRequest, remote_addr: SocketAddr) -> Value {
                     ["mining.set_difficulty", SUBSCRIPTION_ID],
                     ["mining.notify", SUBSCRIPTION_ID]
                 ],
-                EXTRANONCE_1,
+                session_state.extranonce1_hex(),
                 EXTRANONCE_2_SIZE
             ],
             "error": Value::Null
@@ -231,11 +282,81 @@ fn build_response(request: &RpcRequest, remote_addr: SocketAddr) -> Value {
     }
 }
 
-fn write_json_line(writer: &mut BufWriter<TcpStream>, value: &Value) -> io::Result<()> {
-    writer.write_all(value.to_string().as_bytes())?;
+fn build_set_difficulty_push() -> Value {
+    json!({
+        "id": Value::Null,
+        "method": "mining.set_difficulty",
+        "params": [STARTING_DIFFICULTY]
+    })
+}
+
+fn build_notify_push(template_state: &TemplatePollerState) -> Value {
+    let fallback_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    };
+
+    let (job_id, previousblockhash, bits, curtime_hex) = match template_state.latest_template() {
+        Some(template) => (
+            template.job_id.to_string(),
+            template.previousblockhash,
+            template.bits,
+            format!("{:08x}", template.curtime),
+        ),
+        None => (
+            template_state.current_job_counter().to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            "1d00ffff".to_string(),
+            format!("{fallback_time:08x}"),
+        ),
+    };
+
+    json!({
+        "id": Value::Null,
+        "method": "mining.notify",
+        "params": [
+            job_id,
+            previousblockhash,
+            "",
+            "",
+            [],
+            "20000000",
+            bits,
+            curtime_hex,
+            true
+        ]
+    })
+}
+
+fn write_json_line(
+    writer: &mut BufWriter<TcpStream>,
+    remote_addr: SocketAddr,
+    value: &Value,
+) -> io::Result<()> {
+    let line = value.to_string();
+    println!("STRATUM_TX remote={remote_addr} line={line}");
+    writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn generate_extranonce1_hex() -> String {
+    let bytes: [u8; 8] = random();
+    bytes_to_lower_hex(&bytes)
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize]);
+        output.push(HEX[(byte & 0x0f) as usize]);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -272,7 +393,12 @@ mod tests {
             method: "mining.nope".to_string(),
             params: vec![],
         };
-        let response = build_response(&request, "127.0.0.1:12345".parse().expect("valid addr"));
+        let mut session_state = SessionState::default();
+        let response = build_response(
+            &request,
+            "127.0.0.1:12345".parse().expect("valid addr"),
+            &mut session_state,
+        );
         assert_eq!(response["id"], Value::from(99));
         assert_eq!(response["error"]["code"], Value::from(-32601));
         assert_eq!(
@@ -282,25 +408,58 @@ mod tests {
     }
 
     #[test]
+    fn mining_configure_returns_version_rolling_false() {
+        let request = RpcRequest {
+            id: Value::from(41),
+            method: "mining.configure".to_string(),
+            params: vec![
+                json!(["version-rolling"]),
+                json!({"version-rolling.mask":"ffffffff"}),
+            ],
+        };
+        let mut session_state = SessionState::default();
+        let response = build_response(
+            &request,
+            "127.0.0.1:12345".parse().expect("valid addr"),
+            &mut session_state,
+        );
+        assert_eq!(response["id"], Value::from(41));
+        assert!(response["error"].is_null());
+        assert_eq!(response["result"]["version-rolling"], Value::from(false));
+    }
+
+    #[test]
     fn subscribe_and_authorize_return_success_without_error() {
         let subscribe = RpcRequest {
             id: Value::from(1),
             method: "mining.subscribe".to_string(),
             params: vec![Value::from("test/0.1")],
         };
-        let subscribe_response =
-            build_response(&subscribe, "127.0.0.1:12345".parse().expect("valid addr"));
+        let mut session_state = SessionState::default();
+        let subscribe_response = build_response(
+            &subscribe,
+            "127.0.0.1:12345".parse().expect("valid addr"),
+            &mut session_state,
+        );
         assert_eq!(subscribe_response["id"], Value::from(1));
         assert!(subscribe_response["error"].is_null());
         assert!(subscribe_response["result"].is_array());
+        let extranonce1 = subscribe_response["result"][1]
+            .as_str()
+            .expect("extranonce1 should be a string");
+        assert_eq!(extranonce1.len(), 16);
+        assert_eq!(subscribe_response["result"][2], Value::from(8));
 
         let authorize = RpcRequest {
             id: Value::from("auth-1"),
             method: "mining.authorize".to_string(),
             params: vec![Value::from("user.worker"), Value::from("x")],
         };
-        let authorize_response =
-            build_response(&authorize, "127.0.0.1:12345".parse().expect("valid addr"));
+        let authorize_response = build_response(
+            &authorize,
+            "127.0.0.1:12345".parse().expect("valid addr"),
+            &mut session_state,
+        );
         assert_eq!(authorize_response["id"], Value::from("auth-1"));
         assert_eq!(authorize_response["result"], Value::from(true));
         assert!(authorize_response["error"].is_null());

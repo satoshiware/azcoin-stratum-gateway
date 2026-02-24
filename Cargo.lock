@@ -454,6 +454,7 @@ name = "gateway_v1"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

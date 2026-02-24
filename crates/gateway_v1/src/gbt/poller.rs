@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const DEFAULT_POLL_SECS: u64 = 3;
@@ -14,6 +14,7 @@ const AZ_RPC_ERR_MISSING_SEGWIT_RULES: i64 = -8;
 #[derive(Debug, Default)]
 pub struct TemplatePollerState {
     job_counter: AtomicU64,
+    latest_template: RwLock<Option<LatestTemplate>>,
 }
 
 impl TemplatePollerState {
@@ -21,8 +22,45 @@ impl TemplatePollerState {
         self.job_counter.load(Ordering::Relaxed)
     }
 
+    pub fn latest_template(&self) -> Option<LatestTemplate> {
+        match self.latest_template.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     fn next_job_counter(&self) -> u64 {
         self.job_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn set_latest_template(&self, latest_template: LatestTemplate) {
+        match self.latest_template.write() {
+            Ok(mut guard) => {
+                *guard = Some(latest_template);
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = Some(latest_template);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LatestTemplate {
+    pub job_id: u64,
+    pub previousblockhash: String,
+    pub bits: String,
+    pub curtime: u64,
+}
+
+impl LatestTemplate {
+    fn from_snapshot(job_id: u64, snapshot: &TemplateSnapshot) -> Self {
+        Self {
+            job_id,
+            previousblockhash: snapshot.previousblockhash.clone(),
+            bits: snapshot.bits.clone(),
+            curtime: snapshot.curtime,
+        }
     }
 }
 
@@ -70,6 +108,7 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
         match fetch_template(&client, &rpc_url, &rpc_user, &rpc_password).await {
             Ok(template) if template_changed(&last_identity, &template) => {
                 let job = shared_state.next_job_counter();
+                shared_state.set_latest_template(LatestTemplate::from_snapshot(job, &template));
                 println!(
                     "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={}",
                     job,
@@ -123,7 +162,10 @@ async fn fetch_template(
         .await
         .context("AZ RPC request failed")?;
     let status = response.status();
-    let body = response.text().await.context("failed to read AZ RPC body")?;
+    let body = response
+        .text()
+        .await
+        .context("failed to read AZ RPC body")?;
 
     if !status.is_success() {
         return Err(anyhow!(
