@@ -6,7 +6,7 @@ This version currently provides:
 - a basic TCP listener
 - a periodic health log loop
 - newline-delimited JSON request handling (`id`, `method`, `params`)
-- scaffold RPC methods for `mining.subscribe` and `mining.authorize`
+- scaffold RPC methods for `mining.configure`, `mining.subscribe`, `mining.authorize`, and `mining.submit`
 - an `sv2_core` foundation crate that compiles upstream SV2 dependencies (not wired yet)
 
 ## Practical repo structure
@@ -98,11 +98,13 @@ Runtime derivation and validation in container startup:
 
 - Input format: one JSON object per line over TCP
 - Supported methods:
+  - `mining.configure` -> negotiates `version-rolling` (currently accepted)
   - `mining.subscribe` -> returns scaffold subscription result
   - `mining.authorize` -> returns `true` (scaffold accept-all)
+  - `mining.submit` -> MVP validation + duplicate protection (`accepted_unvalidated=true` on accepted shares)
 - Unknown methods return JSON-RPC error `-32601` (`Method not found`)
 - Invalid JSON does not crash the process; the line is rejected and logged
-- Connection state logs include `sessions` (active connections) and `jobs` (currently always `0`)
+- Connection state logs include `sessions`, `jobs`, and share counters (`shares_ok`, `shares_rej`, `shares_dup`)
 
 ## Quick test (PowerShell)
 
