@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Context};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::env;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -47,16 +48,14 @@ impl TemplatePollerState {
 
 #[derive(Debug, Clone)]
 pub struct LatestTemplate {
-    pub job_id: u64,
     pub previousblockhash: String,
     pub bits: String,
     pub curtime: u64,
 }
 
 impl LatestTemplate {
-    fn from_snapshot(job_id: u64, snapshot: &TemplateSnapshot) -> Self {
+    fn from_snapshot(snapshot: &TemplateSnapshot) -> Self {
         Self {
-            job_id,
             previousblockhash: snapshot.previousblockhash.clone(),
             bits: snapshot.bits.clone(),
             curtime: snapshot.curtime,
@@ -85,6 +84,24 @@ struct JsonRpcError {
     message: String,
 }
 
+#[derive(Debug)]
+struct AzRpcError {
+    code: i64,
+    message: String,
+}
+
+impl fmt::Display for AzRpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "AZ RPC error code={} message={}",
+            self.code, self.message
+        )
+    }
+}
+
+impl std::error::Error for AzRpcError {}
+
 pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyhow::Result<()> {
     let rpc_url = env::var("AZ_RPC_URL").context("AZ_RPC_URL is required for GBT poller")?;
     let rpc_user = env::var("AZ_RPC_USER").context("AZ_RPC_USER is required for GBT poller")?;
@@ -107,11 +124,11 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
     loop {
         match fetch_template(&client, &rpc_url, &rpc_user, &rpc_password).await {
             Ok(template) if template_changed(&last_identity, &template) => {
-                let job = shared_state.next_job_counter();
-                shared_state.set_latest_template(LatestTemplate::from_snapshot(job, &template));
+                let template_seq = shared_state.next_job_counter();
+                shared_state.set_latest_template(LatestTemplate::from_snapshot(&template));
                 println!(
                     "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={}",
-                    job,
+                    template_seq,
                     template.height,
                     template.previousblockhash,
                     template.bits,
@@ -122,7 +139,23 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!("TEMPLATE_POLLER poll_failed error=\"{error}\"");
+                if let Some(rpc_error) = error.downcast_ref::<AzRpcError>() {
+                    if rpc_error.code == AZ_RPC_ERR_MISSING_SEGWIT_RULES {
+                        eprintln!(
+                            "TEMPLATE_POLLER poll_failed rpc_error_code={} rpc_error_message=\"{}\" hint=\"missing segwit rules; call getblocktemplate with params=[{{\\\"rules\\\":[\\\"segwit\\\"]}}]\"",
+                            rpc_error.code,
+                            compact_for_log(&rpc_error.message)
+                        );
+                    } else {
+                        eprintln!(
+                            "TEMPLATE_POLLER poll_failed rpc_error_code={} rpc_error_message=\"{}\"",
+                            rpc_error.code,
+                            compact_for_log(&rpc_error.message)
+                        );
+                    }
+                } else {
+                    eprintln!("TEMPLATE_POLLER poll_failed error=\"{error}\"");
+                }
             }
         }
 
@@ -145,14 +178,7 @@ async fn fetch_template(
     rpc_user: &str,
     rpc_password: &str,
 ) -> anyhow::Result<TemplateSnapshot> {
-    let request_body = json!({
-        "jsonrpc": "1.0",
-        "id": "gateway_v1-gbt-poller",
-        "method": "getblocktemplate",
-        "params": [{
-            "rules": ["segwit"]
-        }]
-    });
+    let request_body = build_getblocktemplate_request_body();
 
     let response = client
         .post(rpc_url)
@@ -183,21 +209,25 @@ fn parse_template_response(body: &str) -> anyhow::Result<TemplateSnapshot> {
         serde_json::from_str(body).context("failed to decode AZ RPC JSON response")?;
 
     if let Some(error) = rpc.error {
-        if error.code == AZ_RPC_ERR_MISSING_SEGWIT_RULES {
-            return Err(anyhow!(
-                "AZ RPC getblocktemplate rejected request: missing segwit rules; expected params=[{{\"rules\":[\"segwit\"]}}], rpc_message={}",
-                error.message
-            ));
-        }
-        return Err(anyhow!(
-            "AZ RPC error code={} message={}",
-            error.code,
-            error.message
-        ));
+        return Err(anyhow!(AzRpcError {
+            code: error.code,
+            message: error.message
+        }));
     }
 
     rpc.result
         .context("AZ RPC response missing result for getblocktemplate")
+}
+
+fn build_getblocktemplate_request_body() -> Value {
+    json!({
+        "jsonrpc": "1.0",
+        "id": "gateway_v1-gbt-poller",
+        "method": "getblocktemplate",
+        "params": [{
+            "rules": ["segwit"]
+        }]
+    })
 }
 
 fn template_changed(last_identity: &Option<(u64, String)>, template: &TemplateSnapshot) -> bool {
@@ -291,9 +321,18 @@ mod tests {
         }"#;
 
         let error = parse_template_response(body).expect_err("response should surface rpc error");
-        let message = error.to_string();
-        assert!(message.contains("missing segwit rules"));
-        assert!(message.contains(r#"params=[{"rules":["segwit"]}]"#));
+        let rpc_error = error
+            .downcast_ref::<AzRpcError>()
+            .expect("error should be typed rpc error");
+        assert_eq!(rpc_error.code, -8);
+        assert!(rpc_error.message.contains("segwit rule set"));
+    }
+
+    #[test]
+    fn getblocktemplate_request_includes_segwit_rules_param() {
+        let request = build_getblocktemplate_request_body();
+        assert_eq!(request["method"], Value::from("getblocktemplate"));
+        assert_eq!(request["params"], json!([{ "rules": ["segwit"] }]));
     }
 
     #[test]

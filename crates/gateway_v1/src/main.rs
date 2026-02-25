@@ -1,4 +1,5 @@
 use rand::random;
+use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
@@ -9,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 mod gbt;
 mod version;
@@ -21,14 +23,23 @@ const VERSION_ROLLING_EXTENSION: &str = "version-rolling";
 const DEFAULT_VERSION_ROLLING_MASK: &str = "ffffffff";
 const MAX_ACTIVE_JOBS: usize = 2048;
 const MAX_SEEN_SHARES: usize = 10_000;
+const DEFAULT_SHARE_SINK: &str = "log";
+const DEFAULT_NODE_API_URL: &str = "http://node-api:8000";
+const DEFAULT_NODE_API_SHARE_PATH: &str = "/v1/mining/share";
+const DEFAULT_SHARE_QUEUE_MAX: usize = 5000;
+const DEFAULT_SHARE_HTTP_TIMEOUT_MS: u64 = 2000;
+
+static NEXT_JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct GatewayState {
     sessions: AtomicU64,
     shares_ok: AtomicU64,
     shares_rej: AtomicU64,
     shares_dup: AtomicU64,
+    forwarding_counters: Arc<ForwardingCounters>,
     active_jobs: Mutex<BoundedStringSet>,
     seen_shares: Mutex<BoundedShareSet>,
+    notify_state: Mutex<NotifyJobState>,
     share_sink: Arc<dyn ShareSink>,
 }
 
@@ -37,14 +48,30 @@ impl GatewayState {
         Self::with_share_sink(Arc::new(LogShareSink))
     }
 
+    fn from_env() -> Self {
+        let forwarding_counters = Arc::new(ForwardingCounters::default());
+        let share_sink = build_share_sink_from_env(Arc::clone(&forwarding_counters));
+        Self::with_components(share_sink, forwarding_counters)
+    }
+
     fn with_share_sink(share_sink: Arc<dyn ShareSink>) -> Self {
+        let forwarding_counters = Arc::new(ForwardingCounters::default());
+        Self::with_components(share_sink, forwarding_counters)
+    }
+
+    fn with_components(
+        share_sink: Arc<dyn ShareSink>,
+        forwarding_counters: Arc<ForwardingCounters>,
+    ) -> Self {
         Self {
             sessions: AtomicU64::new(0),
             shares_ok: AtomicU64::new(0),
             shares_rej: AtomicU64::new(0),
             shares_dup: AtomicU64::new(0),
+            forwarding_counters,
             active_jobs: Mutex::new(BoundedStringSet::new(MAX_ACTIVE_JOBS)),
             seen_shares: Mutex::new(BoundedShareSet::new(MAX_SEEN_SHARES)),
+            notify_state: Mutex::new(NotifyJobState::default()),
             share_sink,
         }
     }
@@ -92,9 +119,80 @@ impl GatewayState {
         )
     }
 
+    fn forwarding_counters(&self) -> (u64, u64, u64) {
+        self.forwarding_counters.snapshot()
+    }
+
+    fn allocate_or_reuse_job_id(&self, work_key: &str, force_clean_jobs: bool) -> (String, bool) {
+        let (job_id, allocated_new) = {
+            let mut notify_state = self
+                .notify_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let work_changed = notify_state.work_key.as_deref() != Some(work_key);
+            let needs_new_job = notify_state.job_id.is_none() || work_changed || force_clean_jobs;
+
+            if needs_new_job {
+                let job_id = allocate_job_id();
+                notify_state.work_key = Some(work_key.to_string());
+                notify_state.job_id = Some(job_id.clone());
+                (job_id, true)
+            } else {
+                (
+                    notify_state
+                        .job_id
+                        .clone()
+                        .expect("job_id should exist when reusing work"),
+                    false,
+                )
+            }
+        };
+
+        if allocated_new {
+            self.register_active_job(job_id.clone());
+        }
+
+        (job_id, allocated_new)
+    }
+
     fn emit_share_event(&self, event: ShareEvent) {
         self.share_sink.submit(event);
     }
+}
+
+#[derive(Debug, Default)]
+struct ForwardingCounters {
+    shares_fwd_ok: AtomicU64,
+    shares_fwd_fail: AtomicU64,
+    shares_drop: AtomicU64,
+}
+
+impl ForwardingCounters {
+    fn inc_fwd_ok(&self) {
+        self.shares_fwd_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_fwd_fail(&self) {
+        self.shares_fwd_fail.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_drop(&self) {
+        self.shares_drop.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.shares_fwd_ok.load(Ordering::Relaxed),
+            self.shares_fwd_fail.load(Ordering::Relaxed),
+            self.shares_drop.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct NotifyJobState {
+    work_key: Option<String>,
+    job_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +277,7 @@ impl BoundedShareSet {
 #[derive(Debug, Clone, Serialize)]
 struct ShareEvent {
     ts: u64,
+    ts_ms: i64,
     remote: String,
     worker: String,
     job_id: String,
@@ -205,6 +304,200 @@ impl ShareSink for LogShareSink {
             Err(error) => eprintln!("SHARE_EVENT serialize_failed error=\"{error}\""),
         }
     }
+}
+
+struct CompositeShareSink {
+    sinks: Vec<Arc<dyn ShareSink>>,
+}
+
+impl CompositeShareSink {
+    fn new(sinks: Vec<Arc<dyn ShareSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl ShareSink for CompositeShareSink {
+    fn submit(&self, event: ShareEvent) {
+        for sink in &self.sinks {
+            sink.submit(event.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HttpShareSinkConfig {
+    endpoint: String,
+    bearer_token: Option<String>,
+    queue_max: usize,
+    timeout_ms: u64,
+}
+
+struct HttpShareSink {
+    sender: mpsc::Sender<ShareEvent>,
+    forwarding_counters: Arc<ForwardingCounters>,
+}
+
+impl HttpShareSink {
+    fn new(config: HttpShareSinkConfig, forwarding_counters: Arc<ForwardingCounters>) -> Self {
+        let queue_size = config.queue_max.max(1);
+        let (sender, receiver) = mpsc::channel(queue_size);
+        let forwarding_for_worker = Arc::clone(&forwarding_counters);
+
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("SHARE_HTTP runtime_init_failed error=\"{error}\"");
+                    return;
+                }
+            };
+
+            runtime.block_on(run_http_share_sink_worker(
+                config,
+                forwarding_for_worker,
+                receiver,
+            ));
+        });
+
+        Self {
+            sender,
+            forwarding_counters,
+        }
+    }
+}
+
+impl ShareSink for HttpShareSink {
+    fn submit(&self, event: ShareEvent) {
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                self.forwarding_counters.inc_drop();
+            }
+        }
+    }
+}
+
+async fn run_http_share_sink_worker(
+    config: HttpShareSinkConfig,
+    forwarding_counters: Arc<ForwardingCounters>,
+    mut receiver: mpsc::Receiver<ShareEvent>,
+) {
+    let client = match Client::builder()
+        .timeout(Duration::from_millis(config.timeout_ms))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("SHARE_HTTP client_init_failed error=\"{error}\"");
+            while receiver.recv().await.is_some() {
+                forwarding_counters.inc_fwd_fail();
+            }
+            return;
+        }
+    };
+
+    while let Some(event) = receiver.recv().await {
+        let mut request = client.post(&config.endpoint).json(&event);
+        if let Some(token) = config.bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                forwarding_counters.inc_fwd_ok();
+            }
+            Ok(response) => {
+                forwarding_counters.inc_fwd_fail();
+                eprintln!(
+                    "SHARE_HTTP forward_failed endpoint={} status={}",
+                    config.endpoint,
+                    response.status().as_u16()
+                );
+            }
+            Err(error) => {
+                forwarding_counters.inc_fwd_fail();
+                eprintln!(
+                    "SHARE_HTTP request_failed endpoint={} error=\"{}\"",
+                    config.endpoint, error
+                );
+            }
+        }
+    }
+}
+
+fn build_share_sink_from_env(forwarding_counters: Arc<ForwardingCounters>) -> Arc<dyn ShareSink> {
+    let mode = env::var("AZ_SHARE_SINK")
+        .ok()
+        .unwrap_or_else(|| DEFAULT_SHARE_SINK.to_string())
+        .to_lowercase();
+
+    match mode.as_str() {
+        "log" => Arc::new(LogShareSink),
+        "http" => Arc::new(HttpShareSink::new(
+            http_share_sink_config_from_env(),
+            forwarding_counters,
+        )),
+        "both" => Arc::new(CompositeShareSink::new(vec![
+            Arc::new(LogShareSink),
+            Arc::new(HttpShareSink::new(
+                http_share_sink_config_from_env(),
+                forwarding_counters,
+            )),
+        ])),
+        unknown => {
+            eprintln!("SHARE_SINK unknown_mode={} defaulting=log", unknown);
+            Arc::new(LogShareSink)
+        }
+    }
+}
+
+fn http_share_sink_config_from_env() -> HttpShareSinkConfig {
+    let base_url = env::var("AZ_NODE_API_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NODE_API_URL.to_string());
+    let share_path = env::var("AZ_NODE_API_SHARE_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NODE_API_SHARE_PATH.to_string());
+    let bearer_token = env::var("AZ_NODE_API_TOKEN").ok().and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    });
+    let queue_max = env::var("AZ_SHARE_QUEUE_MAX")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SHARE_QUEUE_MAX)
+        .max(1);
+    let timeout_ms = env::var("AZ_SHARE_HTTP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHARE_HTTP_TIMEOUT_MS)
+        .max(1);
+
+    HttpShareSinkConfig {
+        endpoint: join_api_url(&base_url, &share_path),
+        bearer_token,
+        queue_max,
+        timeout_ms,
+    }
+}
+
+fn join_api_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let normalized_path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("{base}{normalized_path}")
 }
 
 #[derive(Debug, Default)]
@@ -253,7 +546,7 @@ fn main() -> io::Result<()> {
     println!("LISTENING addr={bind_addr}");
 
     let started_at = Instant::now();
-    let state = Arc::new(GatewayState::new());
+    let state = Arc::new(GatewayState::from_env());
     let template_state = Arc::new(TemplatePollerState::default());
     spawn_gbt_poller(Arc::clone(&template_state));
     spawn_health_logger(
@@ -297,8 +590,9 @@ fn spawn_health_logger(
         let sessions = state.sessions.load(Ordering::Relaxed);
         let jobs = template_state.current_job_counter();
         let (shares_ok, shares_rej, shares_dup) = state.share_counters();
+        let (shares_fwd_ok, shares_fwd_fail, shares_drop) = state.forwarding_counters();
         println!(
-            "HEALTH ok uptime={uptime_secs}s sessions={sessions} jobs={jobs} shares_ok={shares_ok} shares_rej={shares_rej} shares_dup={shares_dup}"
+            "HEALTH ok uptime={uptime_secs}s sessions={sessions} jobs={jobs} shares_ok={shares_ok} shares_rej={shares_rej} shares_dup={shares_dup} shares_fwd_ok={shares_fwd_ok} shares_fwd_fail={shares_fwd_fail} shares_drop={shares_drop}"
         );
     });
 }
@@ -374,8 +668,7 @@ fn handle_client_inner(
 
                 if request.method == "mining.authorize" {
                     write_json_line(&mut writer, remote_addr, &build_set_difficulty_push())?;
-                    let notify = build_notify_push(template_state.as_ref());
-                    state.register_active_job(notify.job_id.clone());
+                    let notify = build_notify_push(template_state.as_ref(), state.as_ref(), false);
                     write_json_line(&mut writer, remote_addr, &notify.message)?;
                 }
             }
@@ -592,6 +885,7 @@ fn emit_share_event(
 ) {
     let event = ShareEvent {
         ts: unix_seconds_now(),
+        ts_ms: unix_millis_now(),
         remote: remote_addr.to_string(),
         worker: share.worker.clone(),
         job_id: share.job_id.clone(),
@@ -796,30 +1090,35 @@ fn build_set_difficulty_push() -> Value {
 }
 
 struct NotifyPush {
-    job_id: String,
     message: Value,
 }
 
-fn build_notify_push(template_state: &TemplatePollerState) -> NotifyPush {
-    let fallback_time = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_secs(),
-        Err(_) => 0,
-    };
-
-    let (job_id, previousblockhash, bits, curtime_hex) = match template_state.latest_template() {
-        Some(template) => (
-            template.job_id.to_string(),
-            template.previousblockhash,
-            template.bits,
-            format!("{:08x}", template.curtime),
-        ),
+fn build_notify_push(
+    template_state: &TemplatePollerState,
+    state: &GatewayState,
+    force_clean_jobs: bool,
+) -> NotifyPush {
+    let (work_key, previousblockhash, bits, curtime_hex) = match template_state.latest_template() {
+        Some(template) => {
+            let work_key = format!(
+                "{}:{}:{}",
+                template.previousblockhash, template.bits, template.curtime
+            );
+            (
+                work_key,
+                template.previousblockhash,
+                template.bits,
+                format!("{:08x}", template.curtime),
+            )
+        }
         None => (
-            template_state.current_job_counter().to_string(),
+            "fallback-no-template".to_string(),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             "1d00ffff".to_string(),
-            format!("{fallback_time:08x}"),
+            "00000000".to_string(),
         ),
     };
+    let (job_id, clean_jobs) = state.allocate_or_reuse_job_id(&work_key, force_clean_jobs);
 
     let message = json!({
         "id": Value::Null,
@@ -833,15 +1132,11 @@ fn build_notify_push(template_state: &TemplatePollerState) -> NotifyPush {
             "20000000",
             bits,
             curtime_hex,
-            true
+            clean_jobs
         ]
     });
-    let job_id = message["params"][0]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
 
-    NotifyPush { job_id, message }
+    NotifyPush { message }
 }
 
 fn write_json_line(
@@ -880,6 +1175,19 @@ fn unix_seconds_now() -> u64 {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
     }
+}
+
+fn unix_millis_now() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
+fn allocate_job_id() -> String {
+    NEXT_JOB_ID_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1167,5 +1475,61 @@ mod tests {
         assert!(response["result"].is_null());
         assert_eq!(response["error"]["code"], Value::from(-32602));
         assert_eq!(response["error"]["message"], Value::from("Invalid params"));
+    }
+
+    #[test]
+    fn job_id_is_stable_when_work_does_not_change() {
+        let state = GatewayState::new();
+        let (job_1, clean_jobs_1) =
+            state.allocate_or_reuse_job_id("work:height10:prevhash-a", false);
+        let (job_2, clean_jobs_2) =
+            state.allocate_or_reuse_job_id("work:height10:prevhash-a", false);
+
+        assert_eq!(job_1, job_2);
+        assert!(clean_jobs_1);
+        assert!(!clean_jobs_2);
+        assert!(state.has_active_job(&job_1));
+    }
+
+    #[test]
+    fn job_id_changes_when_work_changes_or_clean_jobs_forced() {
+        let state = GatewayState::new();
+        let (job_1, _) = state.allocate_or_reuse_job_id("work:height10:prevhash-a", false);
+        let (job_2, clean_jobs_2) =
+            state.allocate_or_reuse_job_id("work:height11:prevhash-b", false);
+        let (job_3, clean_jobs_3) =
+            state.allocate_or_reuse_job_id("work:height11:prevhash-b", true);
+
+        assert_ne!(job_1, job_2);
+        assert_ne!(job_2, job_3);
+        assert!(clean_jobs_2);
+        assert!(clean_jobs_3);
+        assert!(state.has_active_job(&job_2));
+        assert!(state.has_active_job(&job_3));
+    }
+
+    #[test]
+    fn notify_reuses_job_id_and_sets_clean_jobs_false_for_resend() {
+        let state = GatewayState::new();
+        let template_state = TemplatePollerState::default();
+
+        let first = build_notify_push(&template_state, &state, false);
+        let second = build_notify_push(&template_state, &state, false);
+
+        assert_eq!(first.message["params"][0], second.message["params"][0]);
+        assert_eq!(first.message["params"][8], Value::from(true));
+        assert_eq!(second.message["params"][8], Value::from(false));
+    }
+
+    #[test]
+    fn notify_allocates_new_job_id_when_clean_jobs_forced() {
+        let state = GatewayState::new();
+        let template_state = TemplatePollerState::default();
+
+        let first = build_notify_push(&template_state, &state, false);
+        let forced = build_notify_push(&template_state, &state, true);
+
+        assert_ne!(first.message["params"][0], forced.message["params"][0]);
+        assert_eq!(forced.message["params"][8], Value::from(true));
     }
 }

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG VERSION=0.1.2
+ARG VERSION=0.1.3
 ARG VCS_REF=unknown
 
 FROM rust:bookworm AS builder

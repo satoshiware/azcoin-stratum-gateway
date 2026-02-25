@@ -93,6 +93,26 @@ Runtime derivation and validation in container startup:
 - `GATEWAY_BIND_PORT` (compose/container derivation input, default: `3333`)
 - `HEALTH_LOG_INTERVAL_SECS` (default: `30`; container startup requires a positive integer)
 - `GATEWAY_PORT` (compose host port mapping, default: `3333`)
+- `AZ_SHARE_SINK` (`log`, `http`, or `both`; default: `log`)
+- `AZ_NODE_API_URL` (default: `http://node-api:8000`)
+- `AZ_NODE_API_SHARE_PATH` (default: `/v1/mining/share`)
+- `AZ_NODE_API_TOKEN` (optional bearer token for share forwarding)
+- `AZ_SHARE_QUEUE_MAX` (bounded non-blocking queue size, default: `5000`)
+- `AZ_SHARE_HTTP_TIMEOUT_MS` (HTTP forward timeout in milliseconds, default: `2000`)
+
+Example compose wiring for share forwarding:
+
+```yaml
+services:
+  azcoin-stratum-gateway:
+    environment:
+      AZ_SHARE_SINK: both
+      AZ_NODE_API_URL: http://node-api:8000
+      AZ_NODE_API_SHARE_PATH: /v1/mining/share
+      AZ_NODE_API_TOKEN: ${AZ_NODE_API_TOKEN}
+      AZ_SHARE_QUEUE_MAX: 5000
+      AZ_SHARE_HTTP_TIMEOUT_MS: 2000
+```
 
 ## Scaffold protocol behavior
 
@@ -104,7 +124,8 @@ Runtime derivation and validation in container startup:
   - `mining.submit` -> MVP validation + duplicate protection (`accepted_unvalidated=true` on accepted shares)
 - Unknown methods return JSON-RPC error `-32601` (`Method not found`)
 - Invalid JSON does not crash the process; the line is rejected and logged
-- Connection state logs include `sessions`, `jobs`, and share counters (`shares_ok`, `shares_rej`, `shares_dup`)
+- `SHARE_EVENT` logs include both `ts` (seconds) and `ts_ms` (epoch milliseconds)
+- Connection state logs include `sessions`, `jobs`, share counters (`shares_ok`, `shares_rej`, `shares_dup`), and forwarding counters (`shares_fwd_ok`, `shares_fwd_fail`, `shares_drop`)
 
 ## Quick test (PowerShell)
 
