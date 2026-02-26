@@ -2,7 +2,7 @@ use rand::random;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sv2_core::stratum_core::bitcoin::hashes::{sha256d, Hash};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 mod gbt;
@@ -28,6 +29,7 @@ const DEFAULT_NODE_API_URL: &str = "http://node-api:8000";
 const DEFAULT_NODE_API_SHARE_PATH: &str = "/v1/mining/share";
 const DEFAULT_SHARE_QUEUE_MAX: usize = 5000;
 const DEFAULT_SHARE_HTTP_TIMEOUT_MS: u64 = 2000;
+const DIFF1_TARGET_HEX: &str = "00000000FFFF0000000000000000000000000000000000000000000000000000";
 
 static NEXT_JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static NEXT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -39,7 +41,9 @@ struct GatewayState {
     shares_dup: AtomicU64,
     forwarding_counters: Arc<ForwardingCounters>,
     active_jobs: Mutex<BoundedStringSet>,
+    job_store: Mutex<BoundedJobStore>,
     seen_shares: Mutex<BoundedShareSet>,
+    worker_stats: Mutex<HashMap<String, WorkerStats>>,
     notify_state: Mutex<NotifyJobState>,
     share_sink: Arc<dyn ShareSink>,
 }
@@ -71,7 +75,9 @@ impl GatewayState {
             shares_dup: AtomicU64::new(0),
             forwarding_counters,
             active_jobs: Mutex::new(BoundedStringSet::new(MAX_ACTIVE_JOBS)),
+            job_store: Mutex::new(BoundedJobStore::new(MAX_ACTIVE_JOBS)),
             seen_shares: Mutex::new(BoundedShareSet::new(MAX_SEEN_SHARES)),
+            worker_stats: Mutex::new(HashMap::new()),
             notify_state: Mutex::new(NotifyJobState::default()),
             share_sink,
         }
@@ -82,7 +88,8 @@ impl GatewayState {
             .active_jobs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.insert(job_id);
+        guard.insert(job_id.clone());
+        self.upsert_job_template(job_id, JobTemplate::default());
     }
 
     fn has_active_job(&self, job_id: &str) -> bool {
@@ -159,6 +166,43 @@ impl GatewayState {
     fn emit_share_event(&self, event: ShareEvent) {
         self.share_sink.submit(event);
     }
+
+    fn upsert_job_template(&self, job_id: String, job_template: JobTemplate) {
+        let mut guard = self
+            .job_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.upsert(job_id, job_template);
+    }
+
+    fn get_job_template(&self, job_id: &str) -> Option<JobTemplate> {
+        let guard = self
+            .job_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(job_id)
+    }
+
+    fn record_worker_share(&self, worker: &str, accepted: bool, share_diff: f64, last_seen: u64) {
+        if worker.is_empty() {
+            return;
+        }
+
+        let mut guard = self
+            .worker_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stats = guard.entry(worker.to_string()).or_default();
+        if accepted {
+            stats.accepted += 1;
+        } else {
+            stats.rejected += 1;
+        }
+        stats.last_seen = last_seen;
+        if share_diff > stats.best_share_diff {
+            stats.best_share_diff = share_diff;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -194,6 +238,59 @@ impl ForwardingCounters {
 struct NotifyJobState {
     work_key: Option<String>,
     job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JobTemplate {
+    prevhash: String,
+    coinb1: String,
+    coinb2: String,
+    merkle_branch: Vec<String>,
+    version: String,
+    nbits: String,
+    job_ntime: String,
+}
+
+#[derive(Debug, Clone)]
+struct BoundedJobStore {
+    max_size: usize,
+    order: VecDeque<String>,
+    map: HashMap<String, JobTemplate>,
+}
+
+impl BoundedJobStore {
+    fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    fn upsert(&mut self, job_id: String, job_template: JobTemplate) {
+        let is_new = !self.map.contains_key(&job_id);
+        if is_new {
+            if self.order.len() >= self.max_size {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                }
+            }
+            self.order.push_back(job_id.clone());
+        }
+        self.map.insert(job_id, job_template);
+    }
+
+    fn get(&self, job_id: &str) -> Option<JobTemplate> {
+        self.map.get(job_id).cloned()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkerStats {
+    accepted: u64,
+    rejected: u64,
+    last_seen: u64,
+    best_share_diff: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -704,6 +801,7 @@ fn handle_client_inner(
                         )?;
                     }
                     let notify = build_notify_push(template_state.as_ref(), state.as_ref(), false);
+                    state.upsert_job_template(notify.job_id.clone(), notify.job_template.clone());
                     write_json_line(
                         &mut writer,
                         remote_addr,
@@ -799,7 +897,7 @@ fn build_response(
                 "error": Value::Null
             })
         }
-        "mining.submit" => build_submit_response(request, remote_addr, state),
+        "mining.submit" => build_submit_response(request, remote_addr, session_state, state),
         _ => json!({
             "id": request.id,
             "result": Value::Null,
@@ -861,52 +959,68 @@ impl SubmitShare {
 
 #[derive(Debug, Clone)]
 enum SubmitValidation {
-    InvalidParams {
-        reason: String,
-        partial: SubmitShare,
-    },
     Rejected {
         share: SubmitShare,
         reason: String,
         duplicate: bool,
+        error: Value,
+        share_diff: f64,
     },
-    Accepted(SubmitShare),
+    Accepted {
+        share: SubmitShare,
+        share_diff: f64,
+    },
 }
 
 fn build_submit_response(
     request: &RpcRequest,
     remote_addr: SocketAddr,
+    session_state: &SessionState,
     state: &GatewayState,
 ) -> Value {
-    let validation = validate_submit_params(&request.params, state);
+    build_submit_response_with_validator(
+        request,
+        remote_addr,
+        session_state,
+        state,
+        unix_seconds_now(),
+        validate_submit_params,
+    )
+}
+
+fn build_submit_response_with_validator<V>(
+    request: &RpcRequest,
+    remote_addr: SocketAddr,
+    session_state: &SessionState,
+    state: &GatewayState,
+    now: u64,
+    validator: V,
+) -> Value
+where
+    V: FnOnce(&Value, &SessionState, &GatewayState) -> SubmitValidation,
+{
+    let validation = validator(&request.params, session_state, state);
+
     match validation {
-        SubmitValidation::InvalidParams { reason, partial } => {
-            state.record_rejected_share(false);
-            emit_share_event(state, remote_addr, &partial, false, Some(reason));
-            json!({
-                "id": request.id,
-                "result": Value::Null,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params"
-                }
-            })
-        }
         SubmitValidation::Rejected {
             share,
             reason,
             duplicate,
+            error,
+            share_diff,
         } => {
             state.record_rejected_share(duplicate);
+            state.record_worker_share(&share.worker, false, share_diff, now);
             emit_share_event(state, remote_addr, &share, false, Some(reason));
             json!({
                 "id": request.id,
                 "result": false,
-                "error": Value::Null
+                "error": error
             })
         }
-        SubmitValidation::Accepted(share) => {
+        SubmitValidation::Accepted { share, share_diff } => {
             state.record_accepted_share();
+            state.record_worker_share(&share.worker, true, share_diff, now);
             emit_share_event(state, remote_addr, &share, true, None);
             json!({
                 "id": request.id,
@@ -942,75 +1056,102 @@ fn emit_share_event(
     state.emit_share_event(event);
 }
 
-fn validate_submit_params(params: &Value, state: &GatewayState) -> SubmitValidation {
+fn validate_submit_params(
+    params: &Value,
+    session_state: &SessionState,
+    state: &GatewayState,
+) -> SubmitValidation {
     let Some(param_array) = params.as_array() else {
-        return SubmitValidation::InvalidParams {
-            reason: "params must be an array".to_string(),
-            partial: partial_submit_fields(params),
-        };
+        return submit_rejected(
+            partial_submit_fields(params),
+            "invalid_submit_params",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     };
 
     if param_array.len() != 5 && param_array.len() != 6 {
-        return SubmitValidation::Rejected {
-            share: partial_submit_fields(params),
-            reason: "invalid_param_count".to_string(),
-            duplicate: false,
-        };
+        return submit_rejected(
+            partial_submit_fields(params),
+            "invalid_param_count",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
     let worker = match param_array.first().and_then(Value::as_str) {
         Some(value) => value.to_string(),
         None => {
-            return SubmitValidation::InvalidParams {
-                reason: "worker_name must be string".to_string(),
-                partial: partial_submit_fields(params),
-            };
+            return submit_rejected(
+                partial_submit_fields(params),
+                "invalid_worker_name_type",
+                false,
+                submit_error("invalid submit params"),
+                0.0,
+            );
         }
     };
     let job_id = match param_array.get(1).and_then(Value::as_str) {
         Some(value) => value.to_string(),
         None => {
-            return SubmitValidation::InvalidParams {
-                reason: "job_id must be string".to_string(),
-                partial: partial_submit_fields(params),
-            };
+            return submit_rejected(
+                partial_submit_fields(params),
+                "invalid_job_id_type",
+                false,
+                submit_error("invalid submit params"),
+                0.0,
+            );
         }
     };
     let extranonce2 = match param_array.get(2).and_then(Value::as_str) {
         Some(value) => value.to_string(),
         None => {
-            return SubmitValidation::InvalidParams {
-                reason: "extranonce2 must be string".to_string(),
-                partial: partial_submit_fields(params),
-            };
+            return submit_rejected(
+                partial_submit_fields(params),
+                "invalid_extranonce2_type",
+                false,
+                submit_error("invalid submit params"),
+                0.0,
+            );
         }
     };
     let ntime = match param_array.get(3).and_then(Value::as_str) {
         Some(value) => value.to_string(),
         None => {
-            return SubmitValidation::InvalidParams {
-                reason: "ntime must be string".to_string(),
-                partial: partial_submit_fields(params),
-            };
+            return submit_rejected(
+                partial_submit_fields(params),
+                "invalid_ntime_type",
+                false,
+                submit_error("invalid submit params"),
+                0.0,
+            );
         }
     };
     let nonce = match param_array.get(4).and_then(Value::as_str) {
         Some(value) => value.to_string(),
         None => {
-            return SubmitValidation::InvalidParams {
-                reason: "nonce must be string".to_string(),
-                partial: partial_submit_fields(params),
-            };
+            return submit_rejected(
+                partial_submit_fields(params),
+                "invalid_nonce_type",
+                false,
+                submit_error("invalid submit params"),
+                0.0,
+            );
         }
     };
     let version_bits = match param_array.get(5) {
         Some(value) => match value.as_str() {
             Some(bits) => bits.to_string(),
             None => {
-                return SubmitValidation::InvalidParams {
-                    reason: "version_bits must be string".to_string(),
-                    partial: partial_submit_fields(params),
-                };
+                return submit_rejected(
+                    partial_submit_fields(params),
+                    "invalid_version_bits_type",
+                    false,
+                    submit_error("invalid submit params"),
+                    0.0,
+                );
             }
         },
         None => String::new(),
@@ -1026,62 +1167,110 @@ fn validate_submit_params(params: &Value, state: &GatewayState) -> SubmitValidat
     };
 
     if share.worker.is_empty() || share.worker.len() > 64 {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "invalid_worker".to_string(),
-            duplicate: false,
-        };
+            "invalid_worker",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
-    if !state.has_active_job(&share.job_id) {
-        return SubmitValidation::Rejected {
+    let Some(session_extranonce1) = session_state.extranonce1_hex.as_deref() else {
+        return submit_rejected(
             share,
-            reason: "unknown_job".to_string(),
-            duplicate: false,
-        };
-    }
+            "missing_extranonce1",
+            false,
+            submit_error("not subscribed"),
+            0.0,
+        );
+    };
 
     if !is_decodable_hex_of_len(&share.extranonce2, (EXTRANONCE_2_SIZE as usize) * 2) {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "bad_extranonce2".to_string(),
-            duplicate: false,
-        };
+            "bad_extranonce2",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
     if !is_decodable_hex_of_len(&share.ntime, 8) {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "bad_ntime".to_string(),
-            duplicate: false,
-        };
+            "bad_ntime",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
     if !is_decodable_hex_of_len(&share.nonce, 8) {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "bad_nonce".to_string(),
-            duplicate: false,
-        };
+            "bad_nonce",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
     if !share.version_bits.is_empty() && !is_decodable_hex_of_len(&share.version_bits, 8) {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "bad_version_bits".to_string(),
-            duplicate: false,
-        };
+            "bad_version_bits",
+            false,
+            submit_error("invalid submit params"),
+            0.0,
+        );
     }
 
     if !state.insert_share_key_if_new(share.duplicate_key()) {
-        return SubmitValidation::Rejected {
+        return submit_rejected(
             share,
-            reason: "duplicate".to_string(),
-            duplicate: true,
-        };
+            "duplicate",
+            true,
+            submit_error("duplicate share"),
+            0.0,
+        );
     }
 
-    SubmitValidation::Accepted(share)
+    let Some(job_template) = state.get_job_template(&share.job_id) else {
+        return submit_rejected(
+            share,
+            "unknown_job",
+            false,
+            submit_error("job not found"),
+            0.0,
+        );
+    };
+
+    let (meets_target, share_diff) =
+        match validate_share_pow(&share, session_extranonce1, &job_template) {
+            Ok(result) => result,
+            Err(_) => {
+                return submit_rejected(
+                    share,
+                    "invalid_job_template",
+                    false,
+                    submit_error("invalid job data"),
+                    0.0,
+                );
+            }
+        };
+
+    if !meets_target {
+        return submit_rejected(
+            share,
+            "low_difficulty_share",
+            false,
+            submit_error("low difficulty share"),
+            share_diff,
+        );
+    }
+
+    SubmitValidation::Accepted { share, share_diff }
 }
 
 fn partial_submit_fields(params: &Value) -> SubmitShare {
@@ -1122,6 +1311,162 @@ fn is_decodable_hex_of_len(input: &str, expected_len: usize) -> bool {
     true
 }
 
+fn submit_error(message: &str) -> Value {
+    json!([23, message, Value::Null])
+}
+
+fn submit_rejected(
+    share: SubmitShare,
+    reason: &str,
+    duplicate: bool,
+    error: Value,
+    share_diff: f64,
+) -> SubmitValidation {
+    SubmitValidation::Rejected {
+        share,
+        reason: reason.to_string(),
+        duplicate,
+        error,
+        share_diff,
+    }
+}
+
+fn validate_share_pow(
+    share: &SubmitShare,
+    session_extranonce1: &str,
+    job_template: &JobTemplate,
+) -> Result<(bool, f64), String> {
+    let coinb1 = decode_hex(&job_template.coinb1)?;
+    let coinb2 = decode_hex(&job_template.coinb2)?;
+    let extranonce1 = decode_hex(session_extranonce1)?;
+    let extranonce2 = decode_hex(&share.extranonce2)?;
+    let mut coinbase =
+        Vec::with_capacity(coinb1.len() + extranonce1.len() + extranonce2.len() + coinb2.len());
+    coinbase.extend_from_slice(&coinb1);
+    coinbase.extend_from_slice(&extranonce1);
+    coinbase.extend_from_slice(&extranonce2);
+    coinbase.extend_from_slice(&coinb2);
+    let coinbase_hash_be = sha256d_bytes(&coinbase);
+
+    let merkle_root_be = merkle_root_from_branch(coinbase_hash_be, &job_template.merkle_branch)?;
+
+    let version = parse_u32_hex_exact(&job_template.version)?;
+    if !share.version_bits.is_empty() {
+        let _ = parse_u32_hex_exact(&share.version_bits)?;
+    }
+    let ntime = parse_u32_hex_exact(&share.ntime)?;
+    let nbits = parse_u32_hex_exact(&job_template.nbits)?;
+    let nonce = parse_u32_hex_exact(&share.nonce)?;
+    let prevhash_be = decode_hex_exact(&job_template.prevhash, 64)?;
+    let _job_ntime = parse_u32_hex_exact(&job_template.job_ntime)?;
+
+    let mut prevhash_le = [0u8; 32];
+    prevhash_le.copy_from_slice(&prevhash_be);
+    prevhash_le.reverse();
+
+    let mut merkle_root_le = merkle_root_be;
+    merkle_root_le.reverse();
+
+    let mut header = Vec::with_capacity(80);
+    header.extend_from_slice(&version.to_le_bytes());
+    header.extend_from_slice(&prevhash_le);
+    header.extend_from_slice(&merkle_root_le);
+    header.extend_from_slice(&ntime.to_le_bytes());
+    header.extend_from_slice(&nbits.to_le_bytes());
+    header.extend_from_slice(&nonce.to_le_bytes());
+
+    let hash_be = sha256d_bytes(&header);
+    let mut hash_le = hash_be;
+    hash_le.reverse();
+
+    let target_le = diff1_target_le();
+    let meets_target = cmp_u256_le(&hash_le, &target_le).is_le();
+    let share_diff = estimate_difficulty(&hash_le, &target_le);
+    Ok((meets_target, share_diff))
+}
+
+fn decode_hex_exact(input: &str, expected_len: usize) -> Result<Vec<u8>, String> {
+    if input.len() != expected_len {
+        return Err("bad_hex_length".to_string());
+    }
+    decode_hex(input)
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    if input.len() % 2 != 0 {
+        return Err("bad_hex_length".to_string());
+    }
+
+    let mut output = Vec::with_capacity(input.len() / 2);
+    for bytes in input.as_bytes().chunks_exact(2) {
+        let pair = std::str::from_utf8(bytes).map_err(|_| "bad_hex".to_string())?;
+        let value = u8::from_str_radix(pair, 16).map_err(|_| "bad_hex".to_string())?;
+        output.push(value);
+    }
+
+    Ok(output)
+}
+
+fn parse_u32_hex_exact(input: &str) -> Result<u32, String> {
+    let bytes = decode_hex_exact(input, 8)?;
+    let mut array = [0u8; 4];
+    array.copy_from_slice(&bytes);
+    Ok(u32::from_be_bytes(array))
+}
+
+fn merkle_root_from_branch(
+    coinbase_hash_be: [u8; 32],
+    merkle_branch: &[String],
+) -> Result<[u8; 32], String> {
+    let mut current = coinbase_hash_be;
+    for branch_entry in merkle_branch {
+        let branch = decode_hex_exact(branch_entry, 64)?;
+        let mut input = Vec::with_capacity(64);
+        input.extend_from_slice(&current);
+        input.extend_from_slice(&branch);
+        current = sha256d_bytes(&input);
+    }
+    Ok(current)
+}
+
+fn sha256d_bytes(input: &[u8]) -> [u8; 32] {
+    sha256d::Hash::hash(input).to_byte_array()
+}
+
+fn diff1_target_le() -> [u8; 32] {
+    let target_be = decode_hex_exact(DIFF1_TARGET_HEX, 64).expect("diff1 target hex must be valid");
+    let mut target_le = [0u8; 32];
+    target_le.copy_from_slice(&target_be);
+    target_le.reverse();
+    target_le
+}
+
+fn cmp_u256_le(lhs: &[u8; 32], rhs: &[u8; 32]) -> std::cmp::Ordering {
+    for idx in (0..32).rev() {
+        if lhs[idx] < rhs[idx] {
+            return std::cmp::Ordering::Less;
+        }
+        if lhs[idx] > rhs[idx] {
+            return std::cmp::Ordering::Greater;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn estimate_difficulty(hash_le: &[u8; 32], target_le: &[u8; 32]) -> f64 {
+    let hash_f = uint256_le_to_f64(hash_le).max(1.0);
+    let target_f = uint256_le_to_f64(target_le);
+    target_f / hash_f
+}
+
+fn uint256_le_to_f64(value: &[u8; 32]) -> f64 {
+    let mut result = 0.0f64;
+    for idx in (0..32).rev() {
+        result = (result * 256.0) + (value[idx] as f64);
+    }
+    result
+}
+
 fn build_set_difficulty_push(diff: u64) -> Value {
     json!({
         "id": Value::Null,
@@ -1153,6 +1498,8 @@ fn send_set_difficulty(
 }
 
 struct NotifyPush {
+    job_id: String,
+    job_template: JobTemplate,
     message: Value,
 }
 
@@ -1182,6 +1529,15 @@ fn build_notify_push(
         ),
     };
     let (job_id, clean_jobs) = state.allocate_or_reuse_job_id(&work_key, force_clean_jobs);
+    let job_template = JobTemplate {
+        prevhash: previousblockhash.clone(),
+        coinb1: String::new(),
+        coinb2: String::new(),
+        merkle_branch: Vec::new(),
+        version: "20000000".to_string(),
+        nbits: bits.clone(),
+        job_ntime: curtime_hex.clone(),
+    };
 
     let message = json!({
         "id": Value::Null,
@@ -1199,7 +1555,11 @@ fn build_notify_push(
         ]
     });
 
-    NotifyPush { message }
+    NotifyPush {
+        job_id,
+        job_template,
+        message,
+    }
 }
 
 fn write_json_line(
@@ -1265,6 +1625,19 @@ fn allocate_session_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_job_template() -> JobTemplate {
+        JobTemplate {
+            prevhash: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            coinb1: "".to_string(),
+            coinb2: "".to_string(),
+            merkle_branch: vec![],
+            version: "20000000".to_string(),
+            nbits: "1d00ffff".to_string(),
+            job_ntime: "699dfecc".to_string(),
+        }
+    }
 
     #[test]
     fn parse_accepts_string_id_method_and_params_array() {
@@ -1427,8 +1800,9 @@ mod tests {
             ]),
         };
         let mut session_state = SessionState::default();
+        let _ = session_state.extranonce1_hex();
         let state = GatewayState::new();
-        state.register_active_job("66".to_string());
+        state.upsert_job_template("66".to_string(), sample_job_template());
         let response = build_response(
             &request,
             "127.0.0.1:12345".parse().expect("valid addr"),
@@ -1436,8 +1810,8 @@ mod tests {
             &state,
         );
         assert_eq!(response["id"], Value::from(10));
-        assert_eq!(response["result"], Value::from(true));
-        assert!(response["error"].is_null());
+        assert_eq!(response["result"], Value::from(false));
+        assert_eq!(response["error"][0], Value::from(23));
     }
 
     #[test]
@@ -1455,6 +1829,7 @@ mod tests {
             ]),
         };
         let mut session_state = SessionState::default();
+        let _ = session_state.extranonce1_hex();
         let state = GatewayState::new();
         let response = build_response(
             &request,
@@ -1464,7 +1839,8 @@ mod tests {
         );
         assert_eq!(response["id"], Value::from(11));
         assert_eq!(response["result"], Value::from(false));
-        assert!(response["error"].is_null());
+        assert_eq!(response["error"][0], Value::from(23));
+        assert_eq!(response["error"][1], Value::from("job not found"));
     }
 
     #[test]
@@ -1475,8 +1851,9 @@ mod tests {
             params: json!(["BenC", "66", "a21d0000", "699dfecc", "zzafcd42", "00010000"]),
         };
         let mut session_state = SessionState::default();
+        let _ = session_state.extranonce1_hex();
         let state = GatewayState::new();
-        state.register_active_job("66".to_string());
+        state.upsert_job_template("66".to_string(), sample_job_template());
         let response = build_response(
             &request,
             "127.0.0.1:12345".parse().expect("valid addr"),
@@ -1485,7 +1862,8 @@ mod tests {
         );
         assert_eq!(response["id"], Value::from(12));
         assert_eq!(response["result"], Value::from(false));
-        assert!(response["error"].is_null());
+        assert_eq!(response["error"][0], Value::from(23));
+        assert_eq!(response["error"][1], Value::from("invalid submit params"));
     }
 
     #[test]
@@ -1503,8 +1881,9 @@ mod tests {
             ]),
         };
         let mut session_state = SessionState::default();
+        let _ = session_state.extranonce1_hex();
         let state = GatewayState::new();
-        state.register_active_job("66".to_string());
+        state.upsert_job_template("66".to_string(), sample_job_template());
 
         let first = build_response(
             &request,
@@ -1519,12 +1898,13 @@ mod tests {
             &state,
         );
 
-        assert_eq!(first["result"], Value::from(true));
+        assert_eq!(first["result"], Value::from(false));
         assert_eq!(second["result"], Value::from(false));
+        assert_eq!(second["error"][1], Value::from("duplicate share"));
 
         let (shares_ok, shares_rej, shares_dup) = state.share_counters();
-        assert_eq!(shares_ok, 1);
-        assert_eq!(shares_rej, 1);
+        assert_eq!(shares_ok, 0);
+        assert_eq!(shares_rej, 2);
         assert_eq!(shares_dup, 1);
     }
 
@@ -1544,9 +1924,9 @@ mod tests {
             &state,
         );
         assert_eq!(response["id"], Value::from(14));
-        assert!(response["result"].is_null());
-        assert_eq!(response["error"]["code"], Value::from(-32602));
-        assert_eq!(response["error"]["message"], Value::from("Invalid params"));
+        assert_eq!(response["result"], Value::from(false));
+        assert_eq!(response["error"][0], Value::from(23));
+        assert_eq!(response["error"][1], Value::from("invalid submit params"));
     }
 
     #[test]
@@ -1603,5 +1983,113 @@ mod tests {
 
         assert_ne!(first.message["params"][0], forced.message["params"][0]);
         assert_eq!(forced.message["params"][8], Value::from(true));
+    }
+
+    #[test]
+    fn worker_accounting_tracks_accept_reject_last_seen_and_best_diff() {
+        let state = GatewayState::new();
+        state.record_worker_share("worker-1", true, 8.0, 100);
+        state.record_worker_share("worker-1", false, 3.5, 101);
+        state.record_worker_share("worker-1", true, 12.25, 102);
+
+        let guard = state
+            .worker_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stats = guard.get("worker-1").expect("worker stats should exist");
+
+        assert_eq!(stats.accepted, 2);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.last_seen, 102);
+        assert_eq!(stats.best_share_diff, 12.25);
+    }
+
+    #[test]
+    fn worker_accounting_ignores_empty_worker_name() {
+        let state = GatewayState::new();
+        state.record_worker_share("", true, 100.0, 999);
+
+        let guard = state
+            .worker_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn submit_path_updates_worker_stats_via_handler() {
+        let request = RpcRequest {
+            id: Value::from(55),
+            method: "mining.submit".to_string(),
+            params: json!([
+                "worker-e2e",
+                "job-1",
+                "a21d000000000000",
+                "699dfecc",
+                "19afcd42"
+            ]),
+        };
+        let remote: SocketAddr = "127.0.0.1:12345".parse().expect("valid addr");
+        let session_state = SessionState::default();
+        let state = GatewayState::new();
+
+        let accepted_share = SubmitShare {
+            worker: "worker-e2e".to_string(),
+            job_id: "job-1".to_string(),
+            extranonce2: "a21d000000000000".to_string(),
+            ntime: "699dfecc".to_string(),
+            nonce: "19afcd42".to_string(),
+            version_bits: String::new(),
+        };
+
+        let accepted_response = build_submit_response_with_validator(
+            &request,
+            remote,
+            &session_state,
+            &state,
+            100,
+            |_params, _session, _state| SubmitValidation::Accepted {
+                share: accepted_share,
+                share_diff: 3.5,
+            },
+        );
+        assert_eq!(accepted_response["result"], Value::from(true));
+
+        let rejected_share = SubmitShare {
+            worker: "worker-e2e".to_string(),
+            job_id: "job-1".to_string(),
+            extranonce2: "a21d000000000000".to_string(),
+            ntime: "699dfecc".to_string(),
+            nonce: "19afcd42".to_string(),
+            version_bits: String::new(),
+        };
+
+        let rejected_response = build_submit_response_with_validator(
+            &request,
+            remote,
+            &session_state,
+            &state,
+            101,
+            |_params, _session, _state| SubmitValidation::Rejected {
+                share: rejected_share,
+                reason: "low_difficulty_share".to_string(),
+                duplicate: false,
+                error: submit_error("low difficulty share"),
+                share_diff: 0.1,
+            },
+        );
+        assert_eq!(rejected_response["result"], Value::from(false));
+
+        let guard = state
+            .worker_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stats = guard
+            .get("worker-e2e")
+            .expect("worker stats should exist after submits");
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.best_share_diff, 3.5);
+        assert_eq!(stats.last_seen, 101);
     }
 }
