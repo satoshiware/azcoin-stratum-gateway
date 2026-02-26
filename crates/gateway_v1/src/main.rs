@@ -499,7 +499,19 @@ async fn run_http_share_sink_worker(
     };
 
     while let Some(event) = receiver.recv().await {
-        let mut request = client.post(&config.endpoint).json(&event);
+        let payload_json = match serde_json::to_value(&event) {
+            Ok(payload_json) => payload_json,
+            Err(error) => {
+                forwarding_counters.inc_fwd_fail();
+                eprintln!(
+                    "SHARE_HTTP payload_serialize_failed endpoint={} error=\"{}\"",
+                    config.endpoint, error
+                );
+                continue;
+            }
+        };
+        println!("SHARE_HTTP payload={}", payload_json.to_string());
+        let mut request = client.post(&config.endpoint).json(&payload_json);
         if let Some(token) = config.bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
