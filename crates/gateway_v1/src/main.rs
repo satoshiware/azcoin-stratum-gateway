@@ -30,6 +30,7 @@ const DEFAULT_SHARE_QUEUE_MAX: usize = 5000;
 const DEFAULT_SHARE_HTTP_TIMEOUT_MS: u64 = 2000;
 
 static NEXT_JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static NEXT_SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct GatewayState {
     sessions: AtomicU64,
@@ -500,9 +501,21 @@ fn join_api_url(base_url: &str, path: &str) -> String {
     format!("{base}{normalized_path}")
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SessionState {
+    session_id: u64,
+    diff_sent: bool,
     extranonce1_hex: Option<String>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            session_id: allocate_session_id(),
+            diff_sent: false,
+            extranonce1_hex: None,
+        }
+    }
 }
 
 impl SessionState {
@@ -664,12 +677,40 @@ fn handle_client_inner(
             Ok(request) => {
                 let response =
                     build_response(&request, remote_addr, &mut session_state, state.as_ref());
-                write_json_line(&mut writer, remote_addr, &response)?;
+                write_json_line(
+                    &mut writer,
+                    remote_addr,
+                    &session_state,
+                    request.method.as_str(),
+                    &response,
+                )?;
+
+                if request.method == "mining.subscribe" {
+                    send_set_difficulty(
+                        &mut writer,
+                        remote_addr,
+                        &mut session_state,
+                        STARTING_DIFFICULTY,
+                    )?;
+                }
 
                 if request.method == "mining.authorize" {
-                    write_json_line(&mut writer, remote_addr, &build_set_difficulty_push())?;
+                    if !session_state.diff_sent {
+                        send_set_difficulty(
+                            &mut writer,
+                            remote_addr,
+                            &mut session_state,
+                            STARTING_DIFFICULTY,
+                        )?;
+                    }
                     let notify = build_notify_push(template_state.as_ref(), state.as_ref(), false);
-                    write_json_line(&mut writer, remote_addr, &notify.message)?;
+                    write_json_line(
+                        &mut writer,
+                        remote_addr,
+                        &session_state,
+                        "mining.notify",
+                        &notify.message,
+                    )?;
                 }
             }
             Err(error) => {
@@ -1081,12 +1122,34 @@ fn is_decodable_hex_of_len(input: &str, expected_len: usize) -> bool {
     true
 }
 
-fn build_set_difficulty_push() -> Value {
+fn build_set_difficulty_push(diff: u64) -> Value {
     json!({
         "id": Value::Null,
         "method": "mining.set_difficulty",
-        "params": [STARTING_DIFFICULTY]
+        "params": [diff]
     })
+}
+
+fn send_set_difficulty(
+    writer: &mut BufWriter<TcpStream>,
+    remote_addr: SocketAddr,
+    session: &mut SessionState,
+    diff: u64,
+) -> io::Result<()> {
+    if session.diff_sent {
+        return Ok(());
+    }
+
+    let message = build_set_difficulty_push(diff);
+    write_json_line(
+        writer,
+        remote_addr,
+        session,
+        "mining.set_difficulty",
+        &message,
+    )?;
+    session.diff_sent = true;
+    Ok(())
 }
 
 struct NotifyPush {
@@ -1142,10 +1205,15 @@ fn build_notify_push(
 fn write_json_line(
     writer: &mut BufWriter<TcpStream>,
     remote_addr: SocketAddr,
+    session: &SessionState,
+    method_for_log: &str,
     value: &Value,
 ) -> io::Result<()> {
     let line = value.to_string();
-    println!("STRATUM_TX remote={remote_addr} line={line}");
+    println!(
+        "STRATUM_TX session_id={} remote={} method={} line={line}",
+        session.session_id, remote_addr, method_for_log
+    );
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
@@ -1188,6 +1256,10 @@ fn allocate_job_id() -> String {
     NEXT_JOB_ID_COUNTER
         .fetch_add(1, Ordering::Relaxed)
         .to_string()
+}
+
+fn allocate_session_id() -> u64 {
+    NEXT_SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
