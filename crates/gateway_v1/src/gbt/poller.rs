@@ -54,6 +54,7 @@ impl TemplatePollerState {
 
 #[derive(Debug, Clone)]
 pub struct LatestTemplate {
+    pub height: u64,
     pub previousblockhash: String,
     pub bits: String,
     pub curtime: u64,
@@ -72,6 +73,7 @@ impl LatestTemplate {
             .map(ToString::to_string)
             .collect();
         Self {
+            height: snapshot.height,
             previousblockhash: snapshot.previousblockhash.clone(),
             bits: snapshot.bits.clone(),
             curtime: snapshot.curtime,
@@ -296,9 +298,8 @@ fn rpc_url_for_log(rpc_url: &str) -> String {
         return "<invalid_az_rpc_url>".to_string();
     };
 
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let _ = parsed.set_username("redacted");
-        let _ = parsed.set_password(None);
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some("***"));
     }
 
     parsed.to_string()
@@ -393,7 +394,7 @@ mod tests {
     #[test]
     fn rpc_url_for_log_redacts_password() {
         let logged = rpc_url_for_log("http://user:supersecret@127.0.0.1:8332");
-        assert!(logged.contains("redacted"));
+        assert!(logged.contains("user:***@"));
         assert!(!logged.contains("supersecret"));
     }
 }

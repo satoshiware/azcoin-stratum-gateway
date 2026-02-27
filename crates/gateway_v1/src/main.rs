@@ -40,6 +40,9 @@ struct GatewayState {
     shares_ok: AtomicU64,
     shares_rej: AtomicU64,
     shares_dup: AtomicU64,
+    notify_real_total: AtomicU64,
+    notify_fallback_total: AtomicU64,
+    last_fallback_reason: Mutex<String>,
     forwarding_counters: Arc<ForwardingCounters>,
     active_jobs: Mutex<BoundedStringSet>,
     job_store: Mutex<BoundedJobStore>,
@@ -74,6 +77,9 @@ impl GatewayState {
             shares_ok: AtomicU64::new(0),
             shares_rej: AtomicU64::new(0),
             shares_dup: AtomicU64::new(0),
+            notify_real_total: AtomicU64::new(0),
+            notify_fallback_total: AtomicU64::new(0),
+            last_fallback_reason: Mutex::new("none".to_string()),
             forwarding_counters,
             active_jobs: Mutex::new(BoundedStringSet::new(MAX_ACTIVE_JOBS)),
             job_store: Mutex::new(BoundedJobStore::new(MAX_ACTIVE_JOBS)),
@@ -130,6 +136,32 @@ impl GatewayState {
 
     fn forwarding_counters(&self) -> (u64, u64, u64) {
         self.forwarding_counters.snapshot()
+    }
+
+    fn record_notify_real(&self) {
+        self.notify_real_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_notify_fallback(&self, reason: NotifyFallbackReason) {
+        self.notify_fallback_total.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self
+            .last_fallback_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = reason.as_str().to_string();
+    }
+
+    fn notify_counters(&self) -> (u64, u64, String) {
+        let last_reason = self
+            .last_fallback_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        (
+            self.notify_real_total.load(Ordering::Relaxed),
+            self.notify_fallback_total.load(Ordering::Relaxed),
+            last_reason,
+        )
     }
 
     fn allocate_or_reuse_job_id(&self, work_key: &str, force_clean_jobs: bool) -> (String, bool) {
@@ -539,7 +571,7 @@ async fn run_http_share_sink_worker(
                 forwarding_counters.inc_fwd_fail();
                 eprintln!(
                     "SHARE_HTTP forward_failed endpoint={} status={}",
-                    config.endpoint,
+                    redact_url_credentials(&config.endpoint),
                     response.status().as_u16()
                 );
             }
@@ -547,7 +579,8 @@ async fn run_http_share_sink_worker(
                 forwarding_counters.inc_fwd_fail();
                 eprintln!(
                     "SHARE_HTTP request_failed endpoint={} error=\"{}\"",
-                    config.endpoint, error
+                    redact_url_credentials(&config.endpoint),
+                    error
                 );
             }
         }
@@ -728,8 +761,17 @@ fn spawn_health_logger(
         let jobs = template_state.current_job_counter();
         let (shares_ok, shares_rej, shares_dup) = state.share_counters();
         let (shares_fwd_ok, shares_fwd_fail, shares_drop) = state.forwarding_counters();
+        let (notify_real_total, notify_fallback_total, last_fallback_reason) =
+            state.notify_counters();
+        let total_decisions = shares_ok + shares_rej;
+        let accept_rate = if total_decisions == 0 {
+            0.0
+        } else {
+            shares_ok as f64 / total_decisions as f64
+        };
+        let validate_shares = gateway_validate_shares_enabled();
         println!(
-            "HEALTH ok uptime={uptime_secs}s sessions={sessions} jobs={jobs} shares_ok={shares_ok} shares_rej={shares_rej} shares_dup={shares_dup} shares_fwd_ok={shares_fwd_ok} shares_fwd_fail={shares_fwd_fail} shares_drop={shares_drop}"
+            "HEALTH ok uptime={uptime_secs}s sessions={sessions} jobs={jobs} shares_ok={shares_ok} shares_rej={shares_rej} shares_dup={shares_dup} accept_rate={accept_rate:.3} validate_shares={validate_shares} notify_real_total={notify_real_total} notify_fallback_total={notify_fallback_total} last_fallback_reason={last_fallback_reason} shares_fwd_ok={shares_fwd_ok} shares_fwd_fail={shares_fwd_fail} shares_drop={shares_drop}"
         );
     });
 }
@@ -795,7 +837,8 @@ fn handle_client_inner(
         if trimmed.is_empty() {
             continue;
         }
-        println!("STRATUM_RX remote={remote_addr} line={trimmed}");
+        let logged_line = sanitize_stratum_log_line(trimmed);
+        println!("STRATUM_RX remote={remote_addr} line={logged_line}");
 
         match parse_rpc_request(trimmed) {
             Ok(request) => {
@@ -1578,6 +1621,7 @@ struct NotifyPush {
 #[derive(Debug, Clone)]
 struct NotifyBuildData {
     work_key: String,
+    template_height: Option<u64>,
     previousblockhash: String,
     bits: String,
     curtime_hex: String,
@@ -1586,7 +1630,6 @@ struct NotifyBuildData {
     coinb2: String,
     merkle_branch: Vec<String>,
     tx_count: usize,
-    built_real: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1596,21 +1639,96 @@ struct NotifyJobParts {
     merkle_branch: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NotifyFallbackReason {
+    TemplateUnavailable,
+    TemplateMissingTxs,
+    CoinbaseNotReady,
+    PrevhashMissingOrBad,
+    MerkleBuildFailed,
+    ExtranonceMissing,
+    InternalError,
+    TimingRace,
+}
+
+impl NotifyFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            NotifyFallbackReason::TemplateUnavailable => "TemplateUnavailable",
+            NotifyFallbackReason::TemplateMissingTxs => "TemplateMissingTxs",
+            NotifyFallbackReason::CoinbaseNotReady => "CoinbaseNotReady",
+            NotifyFallbackReason::PrevhashMissingOrBad => "PrevhashMissingOrBad",
+            NotifyFallbackReason::MerkleBuildFailed => "MerkleBuildFailed",
+            NotifyFallbackReason::ExtranonceMissing => "ExtranonceMissing",
+            NotifyFallbackReason::InternalError => "InternalError",
+            NotifyFallbackReason::TimingRace => "TimingRace",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NotifyBuildError {
+    reason: NotifyFallbackReason,
+    summary: String,
+}
+
+impl NotifyBuildError {
+    fn new(reason: NotifyFallbackReason, summary: impl Into<String>) -> Self {
+        Self {
+            reason,
+            summary: summary.into(),
+        }
+    }
+}
+
 fn build_notify_push(
     template_state: &TemplatePollerState,
     state: &GatewayState,
     force_clean_jobs: bool,
 ) -> NotifyPush {
-    let notify_data = match template_state.latest_template() {
-        Some(template) => build_notify_data_from_template(&template),
-        None => fallback_notify_data(),
+    let template_seq = template_state.current_job_counter();
+    let (notify_data, fallback_error) = match template_state.latest_template() {
+        Some(template) => {
+            let work_key = build_work_key_from_template(&template);
+            match build_notify_data_from_template(&template, work_key.clone()) {
+                Ok(data) => (data, None),
+                Err(error) => (
+                    fallback_notify_data_for_template(&template, work_key),
+                    Some(error),
+                ),
+            }
+        }
+        None => (
+            fallback_notify_data(),
+            Some(NotifyBuildError::new(
+                NotifyFallbackReason::TemplateUnavailable,
+                "no template yet",
+            )),
+        ),
     };
     let (job_id, clean_jobs) =
         state.allocate_or_reuse_job_id(&notify_data.work_key, force_clean_jobs);
-    if notify_data.built_real {
-        println!(
-            "JOB_BUILT job={} txs={} coinb1_len={} coinb2_len={} branch_len={}",
+    let height_for_log = notify_data
+        .template_height
+        .map(|height| height.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    if let Some(error) = fallback_error {
+        state.record_notify_fallback(error.reason);
+        eprintln!(
+            "NOTIFY_FALLBACK reason={} job={} height={} template_seq={} err=\"{}\"",
+            error.reason.as_str(),
             job_id,
+            height_for_log,
+            template_seq,
+            compact_for_log(&error.summary)
+        );
+    } else {
+        state.record_notify_real();
+        println!(
+            "NOTIFY_REAL job={} height={} template_seq={} txs={} coinb1_len={} coinb2_len={} branch_len={}",
+            job_id,
+            height_for_log,
+            template_seq,
             notify_data.tx_count,
             notify_data.coinb1.len(),
             notify_data.coinb2.len(),
@@ -1654,6 +1772,7 @@ fn build_notify_push(
 fn fallback_notify_data() -> NotifyBuildData {
     NotifyBuildData {
         work_key: "fallback-no-template".to_string(),
+        template_height: None,
         previousblockhash: "0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
         bits: "1d00ffff".to_string(),
@@ -1663,13 +1782,16 @@ fn fallback_notify_data() -> NotifyBuildData {
         coinb2: String::new(),
         merkle_branch: Vec::new(),
         tx_count: 0,
-        built_real: false,
     }
 }
 
-fn build_notify_data_from_template(template: &LatestTemplate) -> NotifyBuildData {
-    let mut notify_data = NotifyBuildData {
-        work_key: build_work_key_from_template(template),
+fn fallback_notify_data_for_template(
+    template: &LatestTemplate,
+    work_key: String,
+) -> NotifyBuildData {
+    NotifyBuildData {
+        work_key,
+        template_height: Some(template.height),
         previousblockhash: template.previousblockhash.clone(),
         bits: template.bits.clone(),
         curtime_hex: format!("{:08x}", template.curtime),
@@ -1678,23 +1800,51 @@ fn build_notify_data_from_template(template: &LatestTemplate) -> NotifyBuildData
         coinb2: String::new(),
         merkle_branch: Vec::new(),
         tx_count: template.transaction_count,
-        built_real: false,
-    };
+    }
+}
 
-    if let Ok(parts) = build_real_notify_job_parts(template) {
-        notify_data.coinb1 = parts.coinb1;
-        notify_data.coinb2 = parts.coinb2;
-        notify_data.merkle_branch = parts.merkle_branch;
-        notify_data.built_real = true;
+fn build_notify_data_from_template(
+    template: &LatestTemplate,
+    work_key: String,
+) -> Result<NotifyBuildData, NotifyBuildError> {
+    if decode_hex_exact(&template.previousblockhash, 64).is_err() {
+        return Err(NotifyBuildError::new(
+            NotifyFallbackReason::PrevhashMissingOrBad,
+            "previousblockhash must be 32-byte hex",
+        ));
+    }
+    if parse_u32_hex_exact(&template.version).is_err()
+        || parse_u32_hex_exact(&template.bits).is_err()
+    {
+        return Err(NotifyBuildError::new(
+            NotifyFallbackReason::InternalError,
+            "template version/bits must be 4-byte hex",
+        ));
     }
 
-    notify_data
+    let parts = build_real_notify_job_parts(template)?;
+    Ok(NotifyBuildData {
+        work_key,
+        template_height: Some(template.height),
+        previousblockhash: template.previousblockhash.clone(),
+        bits: template.bits.clone(),
+        curtime_hex: format!("{:08x}", template.curtime),
+        version: template.version.clone(),
+        coinb1: parts.coinb1,
+        coinb2: parts.coinb2,
+        merkle_branch: parts.merkle_branch,
+        tx_count: template.transaction_count,
+    })
 }
 
 fn build_work_key_from_template(template: &LatestTemplate) -> String {
     let mut material = format!(
-        "{}:{}:{}:{}",
-        template.previousblockhash, template.bits, template.curtime, template.version
+        "{}:{}:{}:{}:{}",
+        template.height,
+        template.previousblockhash,
+        template.bits,
+        template.curtime,
+        template.version
     );
     if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
         material.push(':');
@@ -1707,7 +1857,8 @@ fn build_work_key_from_template(template: &LatestTemplate) -> String {
 
     let work_hash = sha256d_bytes(material.as_bytes());
     format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
+        template.height,
         template.previousblockhash,
         template.bits,
         template.curtime,
@@ -1716,21 +1867,39 @@ fn build_work_key_from_template(template: &LatestTemplate) -> String {
     )
 }
 
-fn build_real_notify_job_parts(template: &LatestTemplate) -> Result<NotifyJobParts, String> {
+fn build_real_notify_job_parts(
+    template: &LatestTemplate,
+) -> Result<NotifyJobParts, NotifyBuildError> {
     if template.transaction_hashes.len() != template.transaction_count {
-        return Err("missing_transaction_hashes".to_string());
+        let reason = if template.transaction_hashes.is_empty() && template.transaction_count > 0 {
+            NotifyFallbackReason::TemplateMissingTxs
+        } else {
+            NotifyFallbackReason::TimingRace
+        };
+        return Err(NotifyBuildError::new(
+            reason,
+            format!(
+                "tx_hashes={} transaction_count={}",
+                template.transaction_hashes.len(),
+                template.transaction_count
+            ),
+        ));
     }
 
-    let coinbase_txn_hex = template
-        .coinbase_txn_hex
-        .as_deref()
-        .ok_or_else(|| "missing_coinbase_txn".to_string())?;
+    let coinbase_txn_hex = template.coinbase_txn_hex.as_deref().ok_or_else(|| {
+        NotifyBuildError::new(
+            NotifyFallbackReason::CoinbaseNotReady,
+            "template missing coinbasetxn.data",
+        )
+    })?;
     let (coinb1, coinb2) = split_coinbase_for_extranonce(
         coinbase_txn_hex,
         EXTRANONCE_1_SIZE,
         EXTRANONCE_2_SIZE as usize,
-    )?;
-    let merkle_branch = build_coinbase_merkle_branch(&template.transaction_hashes)?;
+    )
+    .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::ExtranonceMissing, error))?;
+    let merkle_branch = build_coinbase_merkle_branch(&template.transaction_hashes)
+        .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::MerkleBuildFailed, error))?;
 
     Ok(NotifyJobParts {
         coinb1,
@@ -1918,14 +2087,122 @@ fn write_json_line(
     value: &Value,
 ) -> io::Result<()> {
     let line = value.to_string();
+    let line_for_log = sanitize_stratum_log_line(&line);
     println!(
-        "STRATUM_TX session_id={} remote={} method={} line={line}",
+        "STRATUM_TX session_id={} remote={} method={} line={line_for_log}",
         session.session_id, remote_addr, method_for_log
     );
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn sanitize_stratum_log_line(line: &str) -> String {
+    let line_with_redacted_urls = redact_url_credentials(line);
+    let mut parsed: Value = match serde_json::from_str(&line_with_redacted_urls) {
+        Ok(parsed) => parsed,
+        Err(_) => return line_with_redacted_urls,
+    };
+
+    redact_sensitive_json_fields(&mut parsed);
+    redact_mining_authorize_password(&mut parsed);
+    parsed.to_string()
+}
+
+fn redact_mining_authorize_password(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let is_mining_authorize = object
+        .get("method")
+        .and_then(Value::as_str)
+        .map(|method| method == "mining.authorize")
+        .unwrap_or(false);
+    if !is_mining_authorize {
+        return;
+    }
+
+    if let Some(params) = object.get_mut("params").and_then(Value::as_array_mut) {
+        if let Some(password) = params.get_mut(1) {
+            *password = Value::String("****".to_string());
+        }
+    }
+}
+
+fn redact_sensitive_json_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child_value) in map {
+                if is_sensitive_key(key) {
+                    *child_value = Value::String("***".to_string());
+                } else {
+                    redact_sensitive_json_fields(child_value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_json_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "password" | "pass" | "token" | "authorization" | "bearer"
+    )
+}
+
+fn redact_url_credentials(input: &str) -> String {
+    let mut output = input.to_string();
+    for scheme in ["http://", "https://"] {
+        let mut search_start = 0usize;
+        loop {
+            let Some(relative_start) = output[search_start..].find(scheme) else {
+                break;
+            };
+
+            let authority_start = search_start + relative_start + scheme.len();
+            let authority_length = output[authority_start..]
+                .find(|ch: char| matches!(ch, '/' | '?' | '#' | '"' | '\'' | ' ' | '\\'))
+                .unwrap_or(output.len() - authority_start);
+            let authority_end = authority_start + authority_length;
+            let authority = &output[authority_start..authority_end];
+
+            let Some(at_index) = authority.rfind('@') else {
+                search_start = authority_end;
+                continue;
+            };
+            let userinfo = &authority[..at_index];
+            let Some(colon_index) = userinfo.rfind(':') else {
+                search_start = authority_end;
+                continue;
+            };
+
+            let password_start = authority_start + colon_index + 1;
+            let password_end = authority_start + at_index;
+            output.replace_range(password_start..password_end, "***");
+            search_start = password_start + 3;
+        }
+    }
+    output
+}
+
+fn compact_for_log(input: &str) -> String {
+    let normalized = input.replace(['\n', '\r'], " ");
+    let mut compact = String::new();
+    for (idx, ch) in normalized.chars().enumerate() {
+        if idx >= 240 {
+            compact.push_str("...");
+            return compact;
+        }
+        compact.push(ch);
+    }
+    compact
 }
 
 fn generate_extranonce1_hex() -> String {
@@ -1993,6 +2270,7 @@ mod tests {
 
     fn sample_latest_template() -> LatestTemplate {
         LatestTemplate {
+            height: 700001,
             previousblockhash: "0000000000000000000000000000000000000000000000000000000000000001"
                 .to_string(),
             bits: "1d00ffff".to_string(),
@@ -2002,6 +2280,40 @@ mod tests {
             transaction_hashes: vec!["11".repeat(32), "22".repeat(32)],
             transaction_count: 2,
         }
+    }
+
+    #[test]
+    fn redaction_helpers_mask_urls_and_sensitive_json_keys() {
+        let masked_url = redact_url_credentials("http://user:pass@example.com:8332");
+        assert_eq!(masked_url, "http://user:***@example.com:8332");
+
+        let mut payload = json!({
+            "password": "secret",
+            "pass": "abc",
+            "token": "tkn",
+            "authorization": "Bearer top-secret",
+            "bearer": "raw-token",
+            "nested": {
+                "password": "hidden"
+            }
+        });
+        redact_sensitive_json_fields(&mut payload);
+        assert_eq!(payload["password"], Value::from("***"));
+        assert_eq!(payload["pass"], Value::from("***"));
+        assert_eq!(payload["token"], Value::from("***"));
+        assert_eq!(payload["authorization"], Value::from("***"));
+        assert_eq!(payload["bearer"], Value::from("***"));
+        assert_eq!(payload["nested"]["password"], Value::from("***"));
+    }
+
+    #[test]
+    fn stratum_line_redaction_masks_authorize_password() {
+        let line =
+            r#"{"id":2,"method":"mining.authorize","params":["worker-a","my-password-value"]}"#;
+        let redacted = sanitize_stratum_log_line(line);
+        assert!(redacted.contains("\"worker-a\""));
+        assert!(redacted.contains("\"****\""));
+        assert!(!redacted.contains("my-password-value"));
     }
 
     #[test]

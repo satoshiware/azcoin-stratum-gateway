@@ -1,9 +1,9 @@
 git status
 git add -A
-git commit -m "v0.1.4: End of phase 2, release version 0.1.4"
-git tag v0.1.4 -m "v0.1.4"
+git commit -m "v0.1.4: revision needs to mask sensitive information"
+git tag v0.1.4-rev1 -m "v0.1.4"
 git push origin main
-git push origin v0.1.4
+git push origin v0.1.4-rev1
 
 docker build -t ghcr.io/satoshiware/azcoin-stratum-gateway:v0.1.4 .
 
