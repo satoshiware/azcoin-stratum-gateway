@@ -13,6 +13,13 @@ const DEFAULT_POLL_SECS: u64 = 3;
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const AZ_RPC_ERR_MISSING_SEGWIT_RULES: i64 = -8;
 const DEFAULT_TEMPLATE_VERSION: u32 = 0x2000_0000;
+const GBT_CAPABILITIES: [&str; 5] = [
+    "coinbasetxn",
+    "workid",
+    "coinbase/append",
+    "longpoll",
+    "proposal",
+];
 
 #[derive(Debug, Default)]
 pub struct TemplatePollerState {
@@ -370,7 +377,8 @@ fn build_getblocktemplate_request_body() -> Value {
         "id": "gateway_v1-gbt-poller",
         "method": "getblocktemplate",
         "params": [{
-            "rules": ["segwit"]
+            "rules": ["segwit"],
+            "capabilities": GBT_CAPABILITIES
         }]
     })
 }
@@ -527,7 +535,19 @@ mod tests {
     fn getblocktemplate_request_includes_segwit_rules_param() {
         let request = build_getblocktemplate_request_body();
         assert_eq!(request["method"], Value::from("getblocktemplate"));
-        assert_eq!(request["params"], json!([{ "rules": ["segwit"] }]));
+        assert_eq!(
+            request["params"],
+            json!([{
+                "rules": ["segwit"],
+                "capabilities": [
+                    "coinbasetxn",
+                    "workid",
+                    "coinbase/append",
+                    "longpoll",
+                    "proposal"
+                ]
+            }])
+        );
     }
 
     #[test]
