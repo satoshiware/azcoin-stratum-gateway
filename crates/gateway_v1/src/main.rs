@@ -15,9 +15,10 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 
 mod gbt;
 mod version;
-use gbt::poller::TemplatePollerState;
+use gbt::poller::{LatestTemplate, TemplatePollerState};
 
 const SUBSCRIPTION_ID: &str = "1";
+const EXTRANONCE_1_SIZE: usize = 8;
 const EXTRANONCE_2_SIZE: u64 = 8;
 const STARTING_DIFFICULTY: u64 = 1;
 const VERSION_ROLLING_EXTENSION: &str = "version-rolling";
@@ -1099,6 +1100,20 @@ fn validate_submit_params(
     session_state: &SessionState,
     state: &GatewayState,
 ) -> SubmitValidation {
+    validate_submit_params_with_mode(
+        params,
+        session_state,
+        state,
+        gateway_validate_shares_enabled(),
+    )
+}
+
+fn validate_submit_params_with_mode(
+    params: &Value,
+    session_state: &SessionState,
+    state: &GatewayState,
+    validate_shares: bool,
+) -> SubmitValidation {
     let Some(param_array) = params.as_array() else {
         return submit_rejected(
             partial_submit_fields(params),
@@ -1284,6 +1299,13 @@ fn validate_submit_params(
         );
     };
 
+    if !validate_shares {
+        return SubmitValidation::Accepted {
+            share,
+            share_diff: 0.0,
+        };
+    }
+
     let (meets_target, share_diff) =
         match validate_share_pow(&share, session_extranonce1, &job_template) {
             Ok(result) => result,
@@ -1309,6 +1331,18 @@ fn validate_submit_params(
     }
 
     SubmitValidation::Accepted { share, share_diff }
+}
+
+fn gateway_validate_shares_enabled() -> bool {
+    env::var("GATEWAY_VALIDATE_SHARES")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn partial_submit_fields(params: &Value) -> SubmitShare {
@@ -1541,40 +1575,57 @@ struct NotifyPush {
     message: Value,
 }
 
+#[derive(Debug, Clone)]
+struct NotifyBuildData {
+    work_key: String,
+    previousblockhash: String,
+    bits: String,
+    curtime_hex: String,
+    version: String,
+    coinb1: String,
+    coinb2: String,
+    merkle_branch: Vec<String>,
+    tx_count: usize,
+    built_real: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NotifyJobParts {
+    coinb1: String,
+    coinb2: String,
+    merkle_branch: Vec<String>,
+}
+
 fn build_notify_push(
     template_state: &TemplatePollerState,
     state: &GatewayState,
     force_clean_jobs: bool,
 ) -> NotifyPush {
-    let (work_key, previousblockhash, bits, curtime_hex) = match template_state.latest_template() {
-        Some(template) => {
-            let work_key = format!(
-                "{}:{}:{}",
-                template.previousblockhash, template.bits, template.curtime
-            );
-            (
-                work_key,
-                template.previousblockhash,
-                template.bits,
-                format!("{:08x}", template.curtime),
-            )
-        }
-        None => (
-            "fallback-no-template".to_string(),
-            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            "1d00ffff".to_string(),
-            "00000000".to_string(),
-        ),
+    let notify_data = match template_state.latest_template() {
+        Some(template) => build_notify_data_from_template(&template),
+        None => fallback_notify_data(),
     };
-    let (job_id, clean_jobs) = state.allocate_or_reuse_job_id(&work_key, force_clean_jobs);
+    let (job_id, clean_jobs) =
+        state.allocate_or_reuse_job_id(&notify_data.work_key, force_clean_jobs);
+    if notify_data.built_real {
+        println!(
+            "JOB_BUILT job={} txs={} coinb1_len={} coinb2_len={} branch_len={}",
+            job_id,
+            notify_data.tx_count,
+            notify_data.coinb1.len(),
+            notify_data.coinb2.len(),
+            notify_data.merkle_branch.len()
+        );
+    }
+
     let job_template = JobTemplate {
-        prevhash: previousblockhash.clone(),
-        coinb1: String::new(),
-        coinb2: String::new(),
-        merkle_branch: Vec::new(),
-        version: "20000000".to_string(),
-        nbits: bits.clone(),
-        job_ntime: curtime_hex.clone(),
+        prevhash: notify_data.previousblockhash.clone(),
+        coinb1: notify_data.coinb1.clone(),
+        coinb2: notify_data.coinb2.clone(),
+        merkle_branch: notify_data.merkle_branch.clone(),
+        version: notify_data.version.clone(),
+        nbits: notify_data.bits.clone(),
+        job_ntime: notify_data.curtime_hex.clone(),
     };
 
     let message = json!({
@@ -1582,13 +1633,13 @@ fn build_notify_push(
         "method": "mining.notify",
         "params": [
             job_id,
-            previousblockhash,
-            "",
-            "",
-            [],
-            "20000000",
-            bits,
-            curtime_hex,
+            notify_data.previousblockhash,
+            notify_data.coinb1,
+            notify_data.coinb2,
+            notify_data.merkle_branch,
+            notify_data.version,
+            notify_data.bits,
+            notify_data.curtime_hex,
             clean_jobs
         ]
     });
@@ -1598,6 +1649,265 @@ fn build_notify_push(
         job_template,
         message,
     }
+}
+
+fn fallback_notify_data() -> NotifyBuildData {
+    NotifyBuildData {
+        work_key: "fallback-no-template".to_string(),
+        previousblockhash: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        bits: "1d00ffff".to_string(),
+        curtime_hex: "00000000".to_string(),
+        version: "20000000".to_string(),
+        coinb1: String::new(),
+        coinb2: String::new(),
+        merkle_branch: Vec::new(),
+        tx_count: 0,
+        built_real: false,
+    }
+}
+
+fn build_notify_data_from_template(template: &LatestTemplate) -> NotifyBuildData {
+    let mut notify_data = NotifyBuildData {
+        work_key: build_work_key_from_template(template),
+        previousblockhash: template.previousblockhash.clone(),
+        bits: template.bits.clone(),
+        curtime_hex: format!("{:08x}", template.curtime),
+        version: template.version.clone(),
+        coinb1: String::new(),
+        coinb2: String::new(),
+        merkle_branch: Vec::new(),
+        tx_count: template.transaction_count,
+        built_real: false,
+    };
+
+    if let Ok(parts) = build_real_notify_job_parts(template) {
+        notify_data.coinb1 = parts.coinb1;
+        notify_data.coinb2 = parts.coinb2;
+        notify_data.merkle_branch = parts.merkle_branch;
+        notify_data.built_real = true;
+    }
+
+    notify_data
+}
+
+fn build_work_key_from_template(template: &LatestTemplate) -> String {
+    let mut material = format!(
+        "{}:{}:{}:{}",
+        template.previousblockhash, template.bits, template.curtime, template.version
+    );
+    if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
+        material.push(':');
+        material.push_str(coinbase_txn_hex);
+    }
+    for tx_hash in &template.transaction_hashes {
+        material.push(':');
+        material.push_str(tx_hash);
+    }
+
+    let work_hash = sha256d_bytes(material.as_bytes());
+    format!(
+        "{}:{}:{}:{}:{}",
+        template.previousblockhash,
+        template.bits,
+        template.curtime,
+        template.version,
+        bytes_to_lower_hex(&work_hash)
+    )
+}
+
+fn build_real_notify_job_parts(template: &LatestTemplate) -> Result<NotifyJobParts, String> {
+    if template.transaction_hashes.len() != template.transaction_count {
+        return Err("missing_transaction_hashes".to_string());
+    }
+
+    let coinbase_txn_hex = template
+        .coinbase_txn_hex
+        .as_deref()
+        .ok_or_else(|| "missing_coinbase_txn".to_string())?;
+    let (coinb1, coinb2) = split_coinbase_for_extranonce(
+        coinbase_txn_hex,
+        EXTRANONCE_1_SIZE,
+        EXTRANONCE_2_SIZE as usize,
+    )?;
+    let merkle_branch = build_coinbase_merkle_branch(&template.transaction_hashes)?;
+
+    Ok(NotifyJobParts {
+        coinb1,
+        coinb2,
+        merkle_branch,
+    })
+}
+
+fn split_coinbase_for_extranonce(
+    coinbase_tx_hex: &str,
+    extranonce1_size: usize,
+    extranonce2_size: usize,
+) -> Result<(String, String), String> {
+    let coinbase_tx = decode_hex(coinbase_tx_hex)?;
+    if coinbase_tx.len() < 4 {
+        return Err("coinbase_too_short".to_string());
+    }
+
+    let mut cursor = 4usize;
+    if coinbase_tx.get(cursor) == Some(&0x00) && coinbase_tx.get(cursor + 1) == Some(&0x01) {
+        cursor += 2;
+    }
+
+    let input_count = read_varint(&coinbase_tx, &mut cursor)?;
+    if input_count == 0 {
+        return Err("coinbase_missing_inputs".to_string());
+    }
+
+    if coinbase_tx.len() < cursor + 36 {
+        return Err("coinbase_input_truncated".to_string());
+    }
+    cursor += 36;
+
+    let script_len_offset = cursor;
+    let script_len = read_varint(&coinbase_tx, &mut cursor)? as usize;
+    let script_start = cursor;
+    let script_end = script_start
+        .checked_add(script_len)
+        .ok_or_else(|| "coinbase_script_overflow".to_string())?;
+    if coinbase_tx.len() < script_end {
+        return Err("coinbase_script_truncated".to_string());
+    }
+
+    let extranonce_total_size = extranonce1_size
+        .checked_add(extranonce2_size)
+        .ok_or_else(|| "coinbase_extranonce_overflow".to_string())?;
+    let patched_script_len = script_len
+        .checked_add(extranonce_total_size)
+        .ok_or_else(|| "coinbase_script_len_overflow".to_string())?;
+
+    let mut coinb1 = Vec::with_capacity(script_end + 9);
+    coinb1.extend_from_slice(&coinbase_tx[..script_len_offset]);
+    coinb1.extend_from_slice(&encode_varint(patched_script_len as u64));
+    coinb1.extend_from_slice(&coinbase_tx[script_start..script_end]);
+
+    let coinb2 = coinbase_tx[script_end..].to_vec();
+
+    Ok((bytes_to_lower_hex(&coinb1), bytes_to_lower_hex(&coinb2)))
+}
+
+fn read_varint(input: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let prefix = *input
+        .get(*cursor)
+        .ok_or_else(|| "varint_prefix_missing".to_string())?;
+    *cursor += 1;
+
+    match prefix {
+        0x00..=0xfc => Ok(prefix as u64),
+        0xfd => {
+            if input.len() < *cursor + 2 {
+                return Err("varint_u16_truncated".to_string());
+            }
+            let mut bytes = [0u8; 2];
+            bytes.copy_from_slice(&input[*cursor..(*cursor + 2)]);
+            *cursor += 2;
+            Ok(u16::from_le_bytes(bytes) as u64)
+        }
+        0xfe => {
+            if input.len() < *cursor + 4 {
+                return Err("varint_u32_truncated".to_string());
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&input[*cursor..(*cursor + 4)]);
+            *cursor += 4;
+            Ok(u32::from_le_bytes(bytes) as u64)
+        }
+        0xff => {
+            if input.len() < *cursor + 8 {
+                return Err("varint_u64_truncated".to_string());
+            }
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&input[*cursor..(*cursor + 8)]);
+            *cursor += 8;
+            Ok(u64::from_le_bytes(bytes))
+        }
+    }
+}
+
+fn encode_varint(value: u64) -> Vec<u8> {
+    match value {
+        0x00..=0xfc => vec![value as u8],
+        0xfd..=0xffff => {
+            let mut encoded = Vec::with_capacity(3);
+            encoded.push(0xfd);
+            encoded.extend_from_slice(&(value as u16).to_le_bytes());
+            encoded
+        }
+        0x1_0000..=0xffff_ffff => {
+            let mut encoded = Vec::with_capacity(5);
+            encoded.push(0xfe);
+            encoded.extend_from_slice(&(value as u32).to_le_bytes());
+            encoded
+        }
+        _ => {
+            let mut encoded = Vec::with_capacity(9);
+            encoded.push(0xff);
+            encoded.extend_from_slice(&value.to_le_bytes());
+            encoded
+        }
+    }
+}
+
+fn decode_hex_u256(input: &str) -> Result<[u8; 32], String> {
+    let decoded = decode_hex_exact(input, 64)?;
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&decoded);
+    Ok(bytes)
+}
+
+fn hash_merkle_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(left);
+    input[32..].copy_from_slice(right);
+    sha256d_bytes(&input)
+}
+
+fn build_coinbase_merkle_branch(transaction_hashes: &[String]) -> Result<Vec<String>, String> {
+    if transaction_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut level = Vec::with_capacity(transaction_hashes.len() + 1);
+    level.push([0u8; 32]);
+    for tx_hash in transaction_hashes {
+        level.push(decode_hex_u256(tx_hash)?);
+    }
+
+    let mut coinbase_index = 0usize;
+    let mut branch = Vec::new();
+
+    while level.len() > 1 {
+        let sibling_index = if coinbase_index % 2 == 0 {
+            coinbase_index + 1
+        } else {
+            coinbase_index - 1
+        };
+        let sibling = if sibling_index < level.len() {
+            level[sibling_index]
+        } else {
+            level[coinbase_index]
+        };
+        branch.push(bytes_to_lower_hex(&sibling));
+
+        if level.len() % 2 == 1 {
+            let last = *level.last().expect("non-empty merkle level");
+            level.push(last);
+        }
+
+        let mut next_level = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks_exact(2) {
+            next_level.push(hash_merkle_pair(&pair[0], &pair[1]));
+        }
+        level = next_level;
+        coinbase_index /= 2;
+    }
+
+    Ok(branch)
 }
 
 fn write_json_line(
@@ -1674,6 +1984,23 @@ mod tests {
             version: "20000000".to_string(),
             nbits: "1d00ffff".to_string(),
             job_ntime: "699dfecc".to_string(),
+        }
+    }
+
+    fn sample_coinbase_tx_hex() -> &'static str {
+        "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff03010203ffffffff0100000000000000000000000000"
+    }
+
+    fn sample_latest_template() -> LatestTemplate {
+        LatestTemplate {
+            previousblockhash: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            bits: "1d00ffff".to_string(),
+            curtime: 1710000000,
+            version: "20000000".to_string(),
+            coinbase_txn_hex: Some(sample_coinbase_tx_hex().to_string()),
+            transaction_hashes: vec!["11".repeat(32), "22".repeat(32)],
+            transaction_count: 2,
         }
     }
 
@@ -1848,8 +2175,8 @@ mod tests {
             &state,
         );
         assert_eq!(response["id"], Value::from(10));
-        assert_eq!(response["result"], Value::from(false));
-        assert_eq!(response["error"][0], Value::from(23));
+        assert_eq!(response["result"], Value::from(true));
+        assert!(response["error"].is_null());
     }
 
     #[test]
@@ -1936,14 +2263,89 @@ mod tests {
             &state,
         );
 
-        assert_eq!(first["result"], Value::from(false));
+        assert_eq!(first["result"], Value::from(true));
         assert_eq!(second["result"], Value::from(false));
         assert_eq!(second["error"][1], Value::from("duplicate share"));
 
         let (shares_ok, shares_rej, shares_dup) = state.share_counters();
-        assert_eq!(shares_ok, 0);
-        assert_eq!(shares_rej, 2);
+        assert_eq!(shares_ok, 1);
+        assert_eq!(shares_rej, 1);
         assert_eq!(shares_dup, 1);
+    }
+
+    #[test]
+    fn submit_validation_toggle_controls_pow_path() {
+        let request = RpcRequest {
+            id: Value::from(77),
+            method: "mining.submit".to_string(),
+            params: json!([
+                "toggle-worker",
+                "job-toggle",
+                "a21d000000000000",
+                "699dfecc",
+                "19afcd42"
+            ]),
+        };
+        let remote: SocketAddr = "127.0.0.1:12345".parse().expect("valid addr");
+        let mut session_state = SessionState::default();
+        let _ = session_state.extranonce1_hex();
+        let state_toggle_off = GatewayState::new();
+        state_toggle_off.upsert_job_template(
+            "job-toggle".to_string(),
+            JobTemplate {
+                prevhash: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                coinb1: "".to_string(),
+                coinb2: "".to_string(),
+                merkle_branch: vec![],
+                version: "20000000".to_string(),
+                nbits: "zzzzzzzz".to_string(),
+                job_ntime: "699dfecc".to_string(),
+            },
+        );
+
+        let accepted_with_toggle_off = build_submit_response_with_validator(
+            &request,
+            remote,
+            &session_state,
+            &state_toggle_off,
+            200,
+            |params, session, gateway_state| {
+                validate_submit_params_with_mode(params, session, gateway_state, false)
+            },
+        );
+        assert_eq!(accepted_with_toggle_off["result"], Value::from(true));
+        assert!(accepted_with_toggle_off["error"].is_null());
+
+        let state_toggle_on = GatewayState::new();
+        state_toggle_on.upsert_job_template(
+            "job-toggle".to_string(),
+            JobTemplate {
+                prevhash: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                coinb1: "".to_string(),
+                coinb2: "".to_string(),
+                merkle_branch: vec![],
+                version: "20000000".to_string(),
+                nbits: "zzzzzzzz".to_string(),
+                job_ntime: "699dfecc".to_string(),
+            },
+        );
+        let rejected_with_toggle_on = build_submit_response_with_validator(
+            &request,
+            remote,
+            &session_state,
+            &state_toggle_on,
+            201,
+            |params, session, gateway_state| {
+                validate_submit_params_with_mode(params, session, gateway_state, true)
+            },
+        );
+        assert_eq!(rejected_with_toggle_on["result"], Value::from(false));
+        assert_eq!(
+            rejected_with_toggle_on["error"][1],
+            Value::from("invalid job data")
+        );
     }
 
     #[test]
@@ -2021,6 +2423,70 @@ mod tests {
 
         assert_ne!(first.message["params"][0], forced.message["params"][0]);
         assert_eq!(forced.message["params"][8], Value::from(true));
+    }
+
+    #[test]
+    fn notify_with_template_builds_real_job_fields_and_store_matches_notify() {
+        let state = GatewayState::new();
+        let template_state = TemplatePollerState::default();
+        template_state.set_latest_template_for_test(sample_latest_template());
+
+        let notify = build_notify_push(&template_state, &state, false);
+        let coinb1 = notify.message["params"][2]
+            .as_str()
+            .expect("coinb1 should be string");
+        let coinb2 = notify.message["params"][3]
+            .as_str()
+            .expect("coinb2 should be string");
+        let branch = notify.message["params"][4]
+            .as_array()
+            .expect("merkle branch should be array");
+
+        assert!(!coinb1.is_empty());
+        assert!(!coinb2.is_empty());
+        assert!(!branch.is_empty());
+
+        state.upsert_job_template(notify.job_id.clone(), notify.job_template.clone());
+        let stored = state
+            .get_job_template(&notify.job_id)
+            .expect("stored job template should exist");
+        let branch_from_notify: Vec<String> = branch
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .expect("branch entry should be string")
+                    .to_string()
+            })
+            .collect();
+
+        assert_eq!(
+            stored.prevhash,
+            notify.message["params"][1]
+                .as_str()
+                .expect("notify prevhash should be string")
+        );
+        assert_eq!(stored.coinb1, coinb1);
+        assert_eq!(stored.coinb2, coinb2);
+        assert_eq!(stored.merkle_branch, branch_from_notify);
+        assert_eq!(
+            stored.version,
+            notify.message["params"][5]
+                .as_str()
+                .expect("notify version should be string")
+        );
+        assert_eq!(
+            stored.nbits,
+            notify.message["params"][6]
+                .as_str()
+                .expect("notify nbits should be string")
+        );
+        assert_eq!(
+            stored.job_ntime,
+            notify.message["params"][7]
+                .as_str()
+                .expect("notify ntime should be string")
+        );
     }
 
     #[test]

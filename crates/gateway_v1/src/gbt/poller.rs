@@ -11,6 +11,7 @@ use std::time::Duration;
 const DEFAULT_POLL_SECS: u64 = 3;
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const AZ_RPC_ERR_MISSING_SEGWIT_RULES: i64 = -8;
+const DEFAULT_TEMPLATE_VERSION: u32 = 0x2000_0000;
 
 #[derive(Debug, Default)]
 pub struct TemplatePollerState {
@@ -44,6 +45,11 @@ impl TemplatePollerState {
             }
         }
     }
+
+    #[cfg(test)]
+    pub fn set_latest_template_for_test(&self, latest_template: LatestTemplate) {
+        self.set_latest_template(latest_template);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,14 +57,31 @@ pub struct LatestTemplate {
     pub previousblockhash: String,
     pub bits: String,
     pub curtime: u64,
+    pub version: String,
+    pub coinbase_txn_hex: Option<String>,
+    pub transaction_hashes: Vec<String>,
+    pub transaction_count: usize,
 }
 
 impl LatestTemplate {
     fn from_snapshot(snapshot: &TemplateSnapshot) -> Self {
+        let transaction_hashes = snapshot
+            .transactions
+            .iter()
+            .filter_map(TemplateTransaction::tx_hash_hex)
+            .map(ToString::to_string)
+            .collect();
         Self {
             previousblockhash: snapshot.previousblockhash.clone(),
             bits: snapshot.bits.clone(),
             curtime: snapshot.curtime,
+            version: format!("{:08x}", snapshot.version),
+            coinbase_txn_hex: snapshot
+                .coinbasetxn
+                .as_ref()
+                .map(|coinbase| coinbase.data.clone()),
+            transaction_hashes,
+            transaction_count: snapshot.transactions.len(),
         }
     }
 }
@@ -70,6 +93,35 @@ struct TemplateSnapshot {
     bits: String,
     curtime: u64,
     target: String,
+    #[serde(default = "default_template_version")]
+    version: u32,
+    #[serde(default)]
+    coinbasetxn: Option<TemplateCoinbaseTxn>,
+    #[serde(default)]
+    transactions: Vec<TemplateTransaction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateCoinbaseTxn {
+    data: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateTransaction {
+    #[serde(default)]
+    txid: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+impl TemplateTransaction {
+    fn tx_hash_hex(&self) -> Option<&str> {
+        self.txid.as_deref().or(self.hash.as_deref())
+    }
+}
+
+fn default_template_version() -> u32 {
+    DEFAULT_TEMPLATE_VERSION
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +354,9 @@ mod tests {
             bits: "1d00ffff".to_string(),
             curtime: 1,
             target: "ffff".to_string(),
+            version: default_template_version(),
+            coinbasetxn: None,
+            transactions: Vec::new(),
         };
         assert!(template_changed(&None, &template));
         assert!(!template_changed(&Some((10, "aaa".to_string())), &template));
