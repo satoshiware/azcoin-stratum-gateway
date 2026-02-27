@@ -382,6 +382,8 @@ struct ShareEvent {
     difficulty: u32,
     accepted: bool,
     reason: Option<String>,
+    duplicate: bool,
+    share_diff: f64,
     extranonce2: String,
     ntime: String,
     nonce: String,
@@ -499,19 +501,31 @@ async fn run_http_share_sink_worker(
     };
 
     while let Some(event) = receiver.recv().await {
-        let payload_json = match serde_json::to_value(&event) {
-            Ok(payload_json) => payload_json,
-            Err(error) => {
-                forwarding_counters.inc_fwd_fail();
-                eprintln!(
-                    "SHARE_HTTP payload_serialize_failed endpoint={} error=\"{}\"",
-                    config.endpoint, error
-                );
-                continue;
-            }
+        let reason = if event.accepted {
+            String::new()
+        } else {
+            event.reason.clone().unwrap_or_default()
         };
-        println!("SHARE_HTTP payload={}", payload_json.to_string());
-        let mut request = client.post(&config.endpoint).json(&payload_json);
+        let duplicate = event.duplicate || reason == "duplicate";
+        let share_diff = if event.share_diff.is_finite() {
+            event.share_diff
+        } else {
+            0.0
+        };
+        let api_payload = json!({
+            "ts": event.ts,
+            "worker": event.worker,
+            "job_id": event.job_id,
+            "extranonce2": event.extranonce2,
+            "ntime": event.ntime,
+            "nonce": event.nonce,
+            "accepted": event.accepted,
+            "duplicate": duplicate,
+            "share_diff": share_diff,
+            "reason": reason
+        });
+        println!("SHARE_HTTP payload={}", api_payload.to_string());
+        let mut request = client.post(&config.endpoint).json(&api_payload);
         if let Some(token) = config.bearer_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -1023,7 +1037,15 @@ where
         } => {
             state.record_rejected_share(duplicate);
             state.record_worker_share(&share.worker, false, share_diff, now);
-            emit_share_event(state, remote_addr, &share, false, Some(reason));
+            emit_share_event(
+                state,
+                remote_addr,
+                &share,
+                false,
+                Some(reason),
+                duplicate,
+                share_diff,
+            );
             json!({
                 "id": request.id,
                 "result": false,
@@ -1033,7 +1055,7 @@ where
         SubmitValidation::Accepted { share, share_diff } => {
             state.record_accepted_share();
             state.record_worker_share(&share.worker, true, share_diff, now);
-            emit_share_event(state, remote_addr, &share, true, None);
+            emit_share_event(state, remote_addr, &share, true, None, false, share_diff);
             json!({
                 "id": request.id,
                 "result": true,
@@ -1049,6 +1071,8 @@ fn emit_share_event(
     share: &SubmitShare,
     accepted: bool,
     reason: Option<String>,
+    duplicate: bool,
+    share_diff: f64,
 ) {
     let event = ShareEvent {
         ts: unix_seconds_now(),
@@ -1059,6 +1083,8 @@ fn emit_share_event(
         difficulty: 1,
         accepted,
         reason,
+        duplicate,
+        share_diff,
         extranonce2: share.extranonce2.clone(),
         ntime: share.ntime.clone(),
         nonce: share.nonce.clone(),
