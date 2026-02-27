@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use sv2_core::stratum_core::bitcoin::hashes::{sha256d, Hash};
 
 const DEFAULT_POLL_SECS: u64 = 3;
 const HTTP_TIMEOUT_SECS: u64 = 15;
@@ -60,6 +61,9 @@ pub struct LatestTemplate {
     pub curtime: u64,
     pub version: String,
     pub coinbase_txn_hex: Option<String>,
+    pub coinbase_value: Option<u64>,
+    pub coinbase_aux_flags_hex: Option<String>,
+    pub default_witness_commitment_hex: Option<String>,
     pub transaction_hashes: Vec<String>,
     pub transaction_count: usize,
 }
@@ -70,7 +74,6 @@ impl LatestTemplate {
             .transactions
             .iter()
             .filter_map(TemplateTransaction::tx_hash_hex)
-            .map(ToString::to_string)
             .collect();
         Self {
             height: snapshot.height,
@@ -78,10 +81,13 @@ impl LatestTemplate {
             bits: snapshot.bits.clone(),
             curtime: snapshot.curtime,
             version: format!("{:08x}", snapshot.version),
-            coinbase_txn_hex: snapshot
-                .coinbasetxn
+            coinbase_txn_hex: snapshot.coinbase_txn_hex(),
+            coinbase_value: snapshot.coinbasevalue,
+            coinbase_aux_flags_hex: snapshot
+                .coinbaseaux
                 .as_ref()
-                .map(|coinbase| coinbase.data.clone()),
+                .and_then(|aux| aux.flags.clone()),
+            default_witness_commitment_hex: snapshot.default_witness_commitment.clone(),
             transaction_hashes,
             transaction_count: snapshot.transactions.len(),
         }
@@ -100,12 +106,46 @@ struct TemplateSnapshot {
     #[serde(default)]
     coinbasetxn: Option<TemplateCoinbaseTxn>,
     #[serde(default)]
+    coinbase_payload: Option<String>,
+    #[serde(default)]
+    coinbasevalue: Option<u64>,
+    #[serde(default)]
+    coinbaseaux: Option<TemplateCoinbaseAux>,
+    #[serde(default)]
+    default_witness_commitment: Option<String>,
+    #[serde(default)]
     transactions: Vec<TemplateTransaction>,
 }
 
+impl TemplateSnapshot {
+    fn coinbase_txn_hex(&self) -> Option<String> {
+        self.coinbasetxn
+            .as_ref()
+            .and_then(TemplateCoinbaseTxn::as_hex)
+            .or_else(|| self.coinbase_payload.clone())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
-struct TemplateCoinbaseTxn {
-    data: String,
+#[serde(untagged)]
+enum TemplateCoinbaseTxn {
+    DataObject { data: String },
+    HexString(String),
+}
+
+impl TemplateCoinbaseTxn {
+    fn as_hex(&self) -> Option<String> {
+        match self {
+            TemplateCoinbaseTxn::DataObject { data } => Some(data.clone()),
+            TemplateCoinbaseTxn::HexString(hex) => Some(hex.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplateCoinbaseAux {
+    #[serde(default)]
+    flags: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,12 +154,55 @@ struct TemplateTransaction {
     txid: Option<String>,
     #[serde(default)]
     hash: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 impl TemplateTransaction {
-    fn tx_hash_hex(&self) -> Option<&str> {
-        self.txid.as_deref().or(self.hash.as_deref())
+    fn tx_hash_hex(&self) -> Option<String> {
+        if let Some(txid) = self.txid.as_deref() {
+            return Some(txid.to_string());
+        }
+        if let Some(hash) = self.hash.as_deref() {
+            return Some(hash.to_string());
+        }
+        self.data
+            .as_deref()
+            .and_then(txid_hex_from_transaction_data_hex)
     }
+}
+
+fn txid_hex_from_transaction_data_hex(data_hex: &str) -> Option<String> {
+    let raw = decode_hex_for_poller(data_hex)?;
+    let txid = sha256d::Hash::hash(&raw).to_byte_array();
+    Some(bytes_to_lower_hex(&txid))
+}
+
+fn decode_hex_for_poller(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(input.len() / 2);
+    for pair in input.as_bytes().chunks_exact(2) {
+        let pair_str = std::str::from_utf8(pair).ok()?;
+        let value = u8::from_str_radix(pair_str, 16).ok()?;
+        output.push(value);
+    }
+    Some(output)
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize]);
+        output.push(HEX[(byte & 0x0f) as usize]);
+    }
+    output
 }
 
 fn default_template_version() -> u32 {
@@ -180,14 +263,22 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
             Ok(template) if template_changed(&last_identity, &template) => {
                 let template_seq = shared_state.next_job_counter();
                 shared_state.set_latest_template(LatestTemplate::from_snapshot(&template));
+                let coinbasevalue_for_log = template
+                    .coinbasevalue
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_string());
+                let has_coinbasetxn = template.coinbase_txn_hex().is_some();
                 println!(
-                    "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={}",
+                    "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={} txs={} coinbasevalue={} has_coinbasetxn={}",
                     template_seq,
                     template.height,
                     template.previousblockhash,
                     template.bits,
                     template.curtime,
-                    template.target
+                    template.target,
+                    template.transactions.len(),
+                    coinbasevalue_for_log,
+                    has_coinbasetxn
                 );
                 last_identity = Some((template.height, template.previousblockhash));
             }
@@ -331,7 +422,13 @@ mod tests {
                 "previousblockhash":"abc123",
                 "bits":"1d00ffff",
                 "curtime": 1710000000,
-                "target":"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                "target":"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "coinbasevalue": 5000000000,
+                "coinbaseaux": { "flags": "062f503253482f" },
+                "default_witness_commitment": "6a24aa21a9ed1111111111111111111111111111111111111111111111111111111111111111",
+                "transactions": [{
+                    "data": "01000000000100"
+                }]
             },
             "error":null
         }"#;
@@ -345,6 +442,44 @@ mod tests {
             template.target,
             "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
+        assert_eq!(template.coinbasevalue, Some(5_000_000_000));
+        assert_eq!(
+            template
+                .coinbaseaux
+                .as_ref()
+                .and_then(|aux| aux.flags.as_deref()),
+            Some("062f503253482f")
+        );
+        assert!(template.default_witness_commitment.is_some());
+        assert_eq!(template.transactions.len(), 1);
+    }
+
+    #[test]
+    fn latest_template_includes_coinbase_related_fields() {
+        let body = r#"{
+            "id":"gateway_v1-gbt-poller",
+            "result":{
+                "height": 101,
+                "previousblockhash":"00aa",
+                "bits":"1d00ffff",
+                "curtime": 1710000001,
+                "target":"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "coinbasevalue": 123,
+                "coinbaseaux": { "flags": "51" },
+                "default_witness_commitment": "6a24aa21a9ed2222222222222222222222222222222222222222222222222222222222222222",
+                "coinbase_payload": "0100000000",
+                "transactions": []
+            },
+            "error":null
+        }"#;
+
+        let snapshot = parse_template_response(body).expect("response should parse");
+        let latest = LatestTemplate::from_snapshot(&snapshot);
+        assert_eq!(latest.height, 101);
+        assert_eq!(latest.coinbase_value, Some(123));
+        assert_eq!(latest.coinbase_aux_flags_hex.as_deref(), Some("51"));
+        assert!(latest.default_witness_commitment_hex.is_some());
+        assert_eq!(latest.coinbase_txn_hex.as_deref(), Some("0100000000"));
     }
 
     #[test]
@@ -357,6 +492,10 @@ mod tests {
             target: "ffff".to_string(),
             version: default_template_version(),
             coinbasetxn: None,
+            coinbase_payload: None,
+            coinbasevalue: None,
+            coinbaseaux: None,
+            default_witness_commitment: None,
             transactions: Vec::new(),
         };
         assert!(template_changed(&None, &template));

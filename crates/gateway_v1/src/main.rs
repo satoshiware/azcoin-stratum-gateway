@@ -1646,7 +1646,6 @@ enum NotifyFallbackReason {
     CoinbaseNotReady,
     PrevhashMissingOrBad,
     MerkleBuildFailed,
-    ExtranonceMissing,
     InternalError,
     TimingRace,
 }
@@ -1659,7 +1658,6 @@ impl NotifyFallbackReason {
             NotifyFallbackReason::CoinbaseNotReady => "CoinbaseNotReady",
             NotifyFallbackReason::PrevhashMissingOrBad => "PrevhashMissingOrBad",
             NotifyFallbackReason::MerkleBuildFailed => "MerkleBuildFailed",
-            NotifyFallbackReason::ExtranonceMissing => "ExtranonceMissing",
             NotifyFallbackReason::InternalError => "InternalError",
             NotifyFallbackReason::TimingRace => "TimingRace",
         }
@@ -1725,7 +1723,7 @@ fn build_notify_push(
     } else {
         state.record_notify_real();
         println!(
-            "NOTIFY_REAL job={} height={} template_seq={} txs={} coinb1_len={} coinb2_len={} branch_len={}",
+            "NOTIFY_REAL job={} height={} template_seq={} txs={} coinb1_len={} coinb2_len={} merkle_branches={}",
             job_id,
             height_for_log,
             template_seq,
@@ -1839,16 +1837,26 @@ fn build_notify_data_from_template(
 
 fn build_work_key_from_template(template: &LatestTemplate) -> String {
     let mut material = format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
         template.height,
         template.previousblockhash,
         template.bits,
         template.curtime,
-        template.version
+        template.version,
+        template.coinbase_value.unwrap_or_default()
     );
     if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
         material.push(':');
         material.push_str(coinbase_txn_hex);
+    }
+    if let Some(coinbase_aux_flags_hex) = template.coinbase_aux_flags_hex.as_deref() {
+        material.push(':');
+        material.push_str(coinbase_aux_flags_hex);
+    }
+    if let Some(default_witness_commitment_hex) = template.default_witness_commitment_hex.as_deref()
+    {
+        material.push(':');
+        material.push_str(default_witness_commitment_hex);
     }
     for tx_hash in &template.transaction_hashes {
         material.push(':');
@@ -1886,26 +1894,138 @@ fn build_real_notify_job_parts(
         ));
     }
 
-    let coinbase_txn_hex = template.coinbase_txn_hex.as_deref().ok_or_else(|| {
+    let coinbase_value = template.coinbase_value.ok_or_else(|| {
         NotifyBuildError::new(
             NotifyFallbackReason::CoinbaseNotReady,
-            "template missing coinbasetxn.data",
+            "template missing coinbasevalue",
         )
     })?;
-    let (coinb1, coinb2) = split_coinbase_for_extranonce(
-        coinbase_txn_hex,
-        EXTRANONCE_1_SIZE,
-        EXTRANONCE_2_SIZE as usize,
-    )
-    .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::ExtranonceMissing, error))?;
-    let merkle_branch = build_coinbase_merkle_branch(&template.transaction_hashes)
-        .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::MerkleBuildFailed, error))?;
+
+    let (coinb1, coinb2) = if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
+        match split_coinbase_for_extranonce(
+            coinbase_txn_hex,
+            EXTRANONCE_1_SIZE,
+            EXTRANONCE_2_SIZE as usize,
+        ) {
+            Ok(parts) => parts,
+            Err(split_error) => build_coinbase_parts_from_template(template, coinbase_value)
+                .map_err(|fallback_error| {
+                    NotifyBuildError::new(
+                        NotifyFallbackReason::InternalError,
+                        format!(
+                            "coinbasetxn_split_failed=\"{}\" fallback_build_failed=\"{}\"",
+                            split_error, fallback_error
+                        ),
+                    )
+                })?,
+        }
+    } else {
+        build_coinbase_parts_from_template(template, coinbase_value)
+            .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::InternalError, error))?
+    };
+
+    let coinbase_hash_be = coinbase_hash_from_notify_parts(&coinb1, &coinb2)
+        .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::InternalError, error))?;
+    let merkle_branch =
+        build_coinbase_merkle_branch(coinbase_hash_be, &template.transaction_hashes).map_err(
+            |error| NotifyBuildError::new(NotifyFallbackReason::MerkleBuildFailed, error),
+        )?;
 
     Ok(NotifyJobParts {
         coinb1,
         coinb2,
         merkle_branch,
     })
+}
+
+fn build_coinbase_parts_from_template(
+    template: &LatestTemplate,
+    coinbase_value: u64,
+) -> Result<(String, String), String> {
+    let mut script_sig_prefix = serialize_bip34_height_push(template.height)?;
+    if let Some(flags_hex) = template.coinbase_aux_flags_hex.as_deref() {
+        if let Ok(flags) = decode_hex(flags_hex) {
+            script_sig_prefix.extend_from_slice(&flags);
+        }
+    }
+
+    let extranonce_len = EXTRANONCE_1_SIZE
+        .checked_add(EXTRANONCE_2_SIZE as usize)
+        .ok_or_else(|| "coinbase_extranonce_overflow".to_string())?;
+    let script_sig_len = script_sig_prefix
+        .len()
+        .checked_add(extranonce_len)
+        .ok_or_else(|| "coinbase_scriptsig_overflow".to_string())?;
+
+    let mut coinb1 = Vec::new();
+    coinb1.extend_from_slice(&1u32.to_le_bytes());
+    coinb1.extend_from_slice(&encode_varint(1));
+    coinb1.extend_from_slice(&[0u8; 32]);
+    coinb1.extend_from_slice(&u32::MAX.to_le_bytes());
+    coinb1.extend_from_slice(&encode_varint(script_sig_len as u64));
+    coinb1.extend_from_slice(&script_sig_prefix);
+
+    let payout_script = default_coinbase_payout_script();
+    let witness_commitment_script = template
+        .default_witness_commitment_hex
+        .as_deref()
+        .and_then(|hex| decode_hex(hex).ok())
+        .filter(|script| !script.is_empty());
+    let mut output_count = 1usize;
+    if witness_commitment_script.is_some() {
+        output_count += 1;
+    }
+
+    let mut coinb2 = Vec::new();
+    coinb2.extend_from_slice(&u32::MAX.to_le_bytes());
+    coinb2.extend_from_slice(&encode_varint(output_count as u64));
+    coinb2.extend_from_slice(&coinbase_value.to_le_bytes());
+    coinb2.extend_from_slice(&encode_varint(payout_script.len() as u64));
+    coinb2.extend_from_slice(&payout_script);
+    if let Some(commitment_script) = witness_commitment_script {
+        coinb2.extend_from_slice(&0u64.to_le_bytes());
+        coinb2.extend_from_slice(&encode_varint(commitment_script.len() as u64));
+        coinb2.extend_from_slice(&commitment_script);
+    }
+    coinb2.extend_from_slice(&0u32.to_le_bytes());
+
+    Ok((bytes_to_lower_hex(&coinb1), bytes_to_lower_hex(&coinb2)))
+}
+
+fn serialize_bip34_height_push(height: u64) -> Result<Vec<u8>, String> {
+    let mut encoded = Vec::new();
+    let mut value = height;
+    while value > 0 {
+        encoded.push((value & 0xff) as u8);
+        value >>= 8;
+    }
+    if encoded.is_empty() {
+        encoded.push(0);
+    }
+    if encoded.last().copied().unwrap_or(0) & 0x80 != 0 {
+        encoded.push(0);
+    }
+    if encoded.len() > 75 {
+        return Err("coinbase_height_push_too_large".to_string());
+    }
+
+    let mut script = Vec::with_capacity(1 + encoded.len());
+    script.push(encoded.len() as u8);
+    script.extend_from_slice(&encoded);
+    Ok(script)
+}
+
+fn default_coinbase_payout_script() -> Vec<u8> {
+    // Placeholder OP_TRUE script keeps a structurally valid coinbase transaction.
+    vec![0x51]
+}
+
+fn coinbase_hash_from_notify_parts(coinb1_hex: &str, coinb2_hex: &str) -> Result<[u8; 32], String> {
+    let mut coinbase = decode_hex(coinb1_hex)?;
+    coinbase.extend(std::iter::repeat(0u8).take(EXTRANONCE_1_SIZE + EXTRANONCE_2_SIZE as usize));
+    let coinb2 = decode_hex(coinb2_hex)?;
+    coinbase.extend_from_slice(&coinb2);
+    Ok(sha256d_bytes(&coinbase))
 }
 
 fn split_coinbase_for_extranonce(
@@ -2036,13 +2156,16 @@ fn hash_merkle_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     sha256d_bytes(&input)
 }
 
-fn build_coinbase_merkle_branch(transaction_hashes: &[String]) -> Result<Vec<String>, String> {
+fn build_coinbase_merkle_branch(
+    coinbase_hash_be: [u8; 32],
+    transaction_hashes: &[String],
+) -> Result<Vec<String>, String> {
     if transaction_hashes.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut level = Vec::with_capacity(transaction_hashes.len() + 1);
-    level.push([0u8; 32]);
+    level.push(coinbase_hash_be);
     for tx_hash in transaction_hashes {
         level.push(decode_hex_u256(tx_hash)?);
     }
@@ -2277,8 +2400,28 @@ mod tests {
             curtime: 1710000000,
             version: "20000000".to_string(),
             coinbase_txn_hex: Some(sample_coinbase_tx_hex().to_string()),
+            coinbase_value: Some(5_000_000_000),
+            coinbase_aux_flags_hex: Some("062f503253482f".to_string()),
+            default_witness_commitment_hex: None,
             transaction_hashes: vec!["11".repeat(32), "22".repeat(32)],
             transaction_count: 2,
+        }
+    }
+
+    fn sample_latest_template_without_coinbasetxn() -> LatestTemplate {
+        LatestTemplate {
+            height: 700001,
+            previousblockhash: "0000000000000000000000000000000000000000000000000000000000000001"
+                .to_string(),
+            bits: "1d00ffff".to_string(),
+            curtime: 1710000000,
+            version: "20000000".to_string(),
+            coinbase_txn_hex: None,
+            coinbase_value: Some(5_000_000_000),
+            coinbase_aux_flags_hex: Some("062f503253482f".to_string()),
+            default_witness_commitment_hex: None,
+            transaction_hashes: vec![],
+            transaction_count: 0,
         }
     }
 
@@ -2799,6 +2942,29 @@ mod tests {
                 .as_str()
                 .expect("notify ntime should be string")
         );
+    }
+
+    #[test]
+    fn coinbase_builder_produces_non_empty_parts_without_coinbasetxn() {
+        let template = sample_latest_template_without_coinbasetxn();
+        let parts = build_real_notify_job_parts(&template).expect("coinbase parts should build");
+        assert!(!parts.coinb1.is_empty());
+        assert!(!parts.coinb2.is_empty());
+
+        let mut coinbase = decode_hex(&parts.coinb1).expect("coinb1 should decode");
+        coinbase.extend_from_slice(&[0x11; EXTRANONCE_1_SIZE]);
+        coinbase.extend_from_slice(&[0x22; EXTRANONCE_2_SIZE as usize]);
+        coinbase.extend_from_slice(&decode_hex(&parts.coinb2).expect("coinb2 should decode"));
+        let serialized_hex = bytes_to_lower_hex(&coinbase);
+        assert!(!serialized_hex.is_empty());
+        assert_eq!(serialized_hex.len() % 2, 0);
+    }
+
+    #[test]
+    fn merkle_branch_is_empty_when_template_has_zero_transactions() {
+        let branch = build_coinbase_merkle_branch([0u8; 32], &[])
+            .expect("merkle branch should build for empty tx list");
+        assert!(branch.is_empty());
     }
 
     #[test]

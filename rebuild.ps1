@@ -15,8 +15,10 @@ docker build `
   -t ghcr.io/satoshiware/azcoin-stratum-gateway:v0.1.4 `
   -t ghcr.io/satoshiware/azcoin-stratum-gateway:stable `
   -t ghcr.io/satoshiware/azcoin-stratum-gateway:sha-$SHA `
+  -t ghcr.io/satoshiware/azcoin-stratum-gateway:latest `
   .
-
+  
 docker push ghcr.io/satoshiware/azcoin-stratum-gateway:v0.1.4
 docker push ghcr.io/satoshiware/azcoin-stratum-gateway:stable
 docker push ghcr.io/satoshiware/azcoin-stratum-gateway:sha-$SHA
+docker push ghcr.io/satoshiware/azcoin-stratum-gateway:latest
