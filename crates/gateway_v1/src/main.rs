@@ -669,6 +669,7 @@ fn join_api_url(base_url: &str, path: &str) -> String {
 struct SessionState {
     session_id: u64,
     diff_sent: bool,
+    current_difficulty: f64,
     extranonce1_hex: Option<String>,
 }
 
@@ -677,6 +678,7 @@ impl Default for SessionState {
         Self {
             session_id: allocate_session_id(),
             diff_sent: false,
+            current_difficulty: 1.0,
             extranonce1_hex: None,
         }
     }
@@ -1035,6 +1037,13 @@ impl SubmitShare {
 }
 
 #[derive(Debug, Clone)]
+struct ShareRejectDebug {
+    difficulty: f64,
+    hash_prefix: String,
+    target_prefix: String,
+}
+
+#[derive(Debug, Clone)]
 enum SubmitValidation {
     Rejected {
         share: SubmitShare,
@@ -1042,6 +1051,7 @@ enum SubmitValidation {
         duplicate: bool,
         error: Value,
         share_diff: f64,
+        debug: Option<ShareRejectDebug>,
     },
     Accepted {
         share: SubmitShare,
@@ -1085,6 +1095,7 @@ where
             duplicate,
             error,
             share_diff,
+            debug,
         } => {
             state.record_rejected_share(duplicate);
             state.record_worker_share(&share.worker, false, share_diff, now);
@@ -1099,12 +1110,34 @@ where
                 share_diff,
             );
             if gateway_validate_shares_enabled() && state.should_log_share_reject() {
-                eprintln!(
-                    "SHARE_REJ reason={} job={} err=\"{}\"",
-                    share_reject_reason_token(&reason),
-                    share.job_id,
-                    compact_for_log(&reason)
-                );
+                let reason_token = share_reject_reason_token(&reason);
+                if reason_token == "TargetMismatch" {
+                    if let Some(target_debug) = debug.as_ref() {
+                        eprintln!(
+                            "SHARE_REJ reason={} job={} diff={:.3} hash={} target={} err=\"{}\"",
+                            reason_token,
+                            share.job_id,
+                            target_debug.difficulty,
+                            target_debug.hash_prefix,
+                            target_debug.target_prefix,
+                            compact_for_log(&reason)
+                        );
+                    } else {
+                        eprintln!(
+                            "SHARE_REJ reason={} job={} err=\"{}\"",
+                            reason_token,
+                            share.job_id,
+                            compact_for_log(&reason)
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "SHARE_REJ reason={} job={} err=\"{}\"",
+                        reason_token,
+                        share.job_id,
+                        compact_for_log(&reason)
+                    );
+                }
             }
             json!({
                 "id": request.id,
@@ -1365,31 +1398,43 @@ fn validate_submit_params_with_mode(
         };
     }
 
-    let (meets_target, share_diff) =
-        match validate_share_pow(&share, session_extranonce1, &job_template) {
-            Ok(result) => result,
-            Err(error) => {
-                return submit_rejected(
-                    share,
-                    error.reason_code(),
-                    false,
-                    submit_error("invalid job data"),
-                    0.0,
-                );
-            }
-        };
+    let share_evaluation = match validate_share_pow(
+        &share,
+        session_extranonce1,
+        &job_template,
+        session_state.current_difficulty,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return submit_rejected(
+                share,
+                error.reason_code(),
+                false,
+                submit_error("invalid job data"),
+                0.0,
+            );
+        }
+    };
 
-    if !meets_target {
-        return submit_rejected(
+    if !share_evaluation.meets_target {
+        return submit_rejected_with_debug(
             share,
             "low_difficulty_share",
             false,
             submit_error("low difficulty share"),
-            share_diff,
+            share_evaluation.share_diff,
+            Some(ShareRejectDebug {
+                difficulty: session_state.current_difficulty,
+                hash_prefix: short_u256_hex_from_le(&share_evaluation.hash_le),
+                target_prefix: short_u256_hex_from_le(&share_evaluation.share_target_le),
+            }),
         );
     }
 
-    SubmitValidation::Accepted { share, share_diff }
+    SubmitValidation::Accepted {
+        share,
+        share_diff: share_evaluation.share_diff,
+    }
 }
 
 fn gateway_validate_shares_enabled() -> bool {
@@ -1465,12 +1510,24 @@ fn submit_rejected(
     error: Value,
     share_diff: f64,
 ) -> SubmitValidation {
+    submit_rejected_with_debug(share, reason, duplicate, error, share_diff, None)
+}
+
+fn submit_rejected_with_debug(
+    share: SubmitShare,
+    reason: &str,
+    duplicate: bool,
+    error: Value,
+    share_diff: f64,
+    debug: Option<ShareRejectDebug>,
+) -> SubmitValidation {
     SubmitValidation::Rejected {
         share,
         reason: reason.to_string(),
         duplicate,
         error,
         share_diff,
+        debug,
     }
 }
 
@@ -1491,11 +1548,20 @@ impl SharePowError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SharePowEvaluation {
+    meets_target: bool,
+    share_diff: f64,
+    hash_le: [u8; 32],
+    share_target_le: [u8; 32],
+}
+
 fn validate_share_pow(
     share: &SubmitShare,
     session_extranonce1: &str,
     job_template: &JobTemplate,
-) -> Result<(bool, f64), SharePowError> {
+    session_difficulty: f64,
+) -> Result<SharePowEvaluation, SharePowError> {
     let coinb1 =
         decode_hex(&job_template.coinb1).map_err(|_| SharePowError::CoinbaseHashMismatch)?;
     let coinb2 =
@@ -1549,10 +1615,16 @@ fn validate_share_pow(
     let mut hash_le = hash_be;
     hash_le.reverse();
 
-    let target_le = diff1_target_le();
-    let meets_target = cmp_u256_le(&hash_le, &target_le).is_le();
-    let share_diff = estimate_difficulty(&hash_le, &target_le);
-    Ok((meets_target, share_diff))
+    let share_target_le = share_target_from_difficulty_le(session_difficulty)
+        .map_err(|_| SharePowError::InternalError)?;
+    let meets_target = cmp_u256_le(&hash_le, &share_target_le).is_le();
+    let share_diff = estimate_difficulty(&hash_le, &diff1_target_le());
+    Ok(SharePowEvaluation {
+        meets_target,
+        share_diff,
+        hash_le,
+        share_target_le,
+    })
 }
 
 fn decode_hex_exact(input: &str, expected_len: usize) -> Result<Vec<u8>, String> {
@@ -1611,6 +1683,62 @@ fn diff1_target_le() -> [u8; 32] {
     target_le
 }
 
+fn share_target_from_difficulty_le(difficulty: f64) -> Result<[u8; 32], String> {
+    if !difficulty.is_finite() || difficulty <= 0.0 {
+        return Err("invalid_difficulty".to_string());
+    }
+
+    const DIFFICULTY_SCALE: u64 = 1_000_000;
+    let scaled_f64 = (difficulty * DIFFICULTY_SCALE as f64).round();
+    if !scaled_f64.is_finite() || scaled_f64 < 1.0 || scaled_f64 > u64::MAX as f64 {
+        return Err("invalid_difficulty".to_string());
+    }
+    let difficulty_scaled = scaled_f64 as u64;
+
+    let diff1 = diff1_target_le();
+    let numerator = mul_u256_le_by_u64(&diff1, DIFFICULTY_SCALE)?;
+    let (target_le, _) = div_u256_le_by_u64(&numerator, difficulty_scaled)?;
+    Ok(target_le)
+}
+
+fn mul_u256_le_by_u64(value_le: &[u8; 32], multiplier: u64) -> Result<[u8; 32], String> {
+    let mut output = [0u8; 32];
+    let mut carry: u128 = 0;
+    for (idx, byte) in value_le.iter().enumerate() {
+        let product = (*byte as u128) * (multiplier as u128) + carry;
+        output[idx] = product as u8;
+        carry = product >> 8;
+    }
+    if carry != 0 {
+        return Err("u256_overflow".to_string());
+    }
+    Ok(output)
+}
+
+fn div_u256_le_by_u64(value_le: &[u8; 32], divisor: u64) -> Result<([u8; 32], u64), String> {
+    if divisor == 0 {
+        return Err("division_by_zero".to_string());
+    }
+
+    let mut quotient_le = [0u8; 32];
+    let mut remainder: u128 = 0;
+    for idx in (0..32).rev() {
+        let current = (remainder << 8) + value_le[idx] as u128;
+        let q = current / divisor as u128;
+        let r = current % divisor as u128;
+        quotient_le[idx] = q as u8;
+        remainder = r;
+    }
+
+    Ok((quotient_le, remainder as u64))
+}
+
+fn short_u256_hex_from_le(value_le: &[u8; 32]) -> String {
+    let mut value_be = *value_le;
+    value_be.reverse();
+    bytes_to_lower_hex(&value_be[..4])
+}
+
 fn cmp_u256_le(lhs: &[u8; 32], rhs: &[u8; 32]) -> std::cmp::Ordering {
     for idx in (0..32).rev() {
         if lhs[idx] < rhs[idx] {
@@ -1663,6 +1791,7 @@ fn send_set_difficulty(
         "mining.set_difficulty",
         &message,
     )?;
+    session.current_difficulty = diff as f64;
     session.diff_sent = true;
     Ok(())
 }
@@ -2522,6 +2651,35 @@ mod tests {
     }
 
     #[test]
+    fn share_target_difficulty_one_equals_diff1_target() {
+        let target =
+            share_target_from_difficulty_le(1.0).expect("difficulty=1 target should build");
+        assert_eq!(target, diff1_target_le());
+    }
+
+    #[test]
+    fn share_target_difficulty_two_equals_diff1_div_two() {
+        let target =
+            share_target_from_difficulty_le(2.0).expect("difficulty=2 target should build");
+        let (expected, _) =
+            div_u256_le_by_u64(&diff1_target_le(), 2).expect("diff1/2 should succeed");
+        assert_eq!(target, expected);
+    }
+
+    #[test]
+    fn hash_target_compare_uses_consistent_integer_ordering() {
+        let mut target = [0u8; 32];
+        target[0] = 0x10;
+        let mut hash_below = [0u8; 32];
+        hash_below[0] = 0x0f;
+        let mut hash_above = [0u8; 32];
+        hash_above[0] = 0x11;
+
+        assert!(cmp_u256_le(&hash_below, &target).is_le());
+        assert!(!cmp_u256_le(&hash_above, &target).is_le());
+    }
+
+    #[test]
     fn stratum_line_redaction_masks_authorize_password() {
         let line =
             r#"{"id":2,"method":"mining.authorize","params":["worker-a","my-password-value"]}"#;
@@ -3168,6 +3326,7 @@ mod tests {
                 duplicate: false,
                 error: submit_error("low difficulty share"),
                 share_diff: 0.1,
+                debug: None,
             },
         );
         assert_eq!(rejected_response["result"], Value::from(false));

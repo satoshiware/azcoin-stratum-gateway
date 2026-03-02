@@ -47,6 +47,6 @@ mod tests {
 
     #[test]
     fn get_version_returns_release_version() {
-        assert_eq!(get_version(), "0.1.3");
+        assert_eq!(get_version(), "0.1.4-rev1");
     }
 }

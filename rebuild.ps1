@@ -1,12 +1,12 @@
 git status
 git add -A
-git commit -m "v0.1.4-rev1: segwit rules"
+git commit -m "v0.1.4-final: pivoting to use SRI"
 
 # Vanilla release tag (this is what stable will point to)
-git tag v0.1.4-rev1 -m "v0.1.4-rev1"
+git tag v0.1.4-final -m "v0.1.4-final"
 
 git push origin main
-git push origin v0.1.4-rev1 
+git push origin v0.1.4-final 
 
 $SHA = (git rev-parse --short HEAD).Trim()
 
