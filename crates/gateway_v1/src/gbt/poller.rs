@@ -13,13 +13,6 @@ const DEFAULT_POLL_SECS: u64 = 3;
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const AZ_RPC_ERR_MISSING_SEGWIT_RULES: i64 = -8;
 const DEFAULT_TEMPLATE_VERSION: u32 = 0x2000_0000;
-const GBT_CAPABILITIES: [&str; 5] = [
-    "coinbasetxn",
-    "workid",
-    "coinbase/append",
-    "longpoll",
-    "proposal",
-];
 
 #[derive(Debug, Default)]
 pub struct TemplatePollerState {
@@ -67,6 +60,8 @@ pub struct LatestTemplate {
     pub bits: String,
     pub curtime: u64,
     pub version: String,
+    pub rules: Vec<String>,
+    pub segwit_active: bool,
     pub coinbase_txn_hex: Option<String>,
     pub coinbase_value: Option<u64>,
     pub coinbase_aux_flags_hex: Option<String>,
@@ -77,6 +72,7 @@ pub struct LatestTemplate {
 
 impl LatestTemplate {
     fn from_snapshot(snapshot: &TemplateSnapshot) -> Self {
+        let (segwit_active, _) = derive_segwit_flags(&snapshot.rules);
         let transaction_hashes = snapshot
             .transactions
             .iter()
@@ -88,6 +84,8 @@ impl LatestTemplate {
             bits: snapshot.bits.clone(),
             curtime: snapshot.curtime,
             version: format!("{:08x}", snapshot.version),
+            rules: snapshot.rules.clone(),
+            segwit_active,
             coinbase_txn_hex: snapshot.coinbase_txn_hex(),
             coinbase_value: snapshot.coinbasevalue,
             coinbase_aux_flags_hex: snapshot
@@ -108,6 +106,8 @@ struct TemplateSnapshot {
     bits: String,
     curtime: u64,
     target: String,
+    #[serde(default)]
+    rules: Vec<String>,
     #[serde(default = "default_template_version")]
     version: u32,
     #[serde(default)]
@@ -216,6 +216,22 @@ fn default_template_version() -> u32 {
     DEFAULT_TEMPLATE_VERSION
 }
 
+fn derive_segwit_flags(rules: &[String]) -> (bool, bool) {
+    let mut segwit_positive = false;
+    let mut segwit_negated = false;
+
+    for rule in rules {
+        let lowered = rule.trim().to_ascii_lowercase();
+        if lowered == "segwit" {
+            segwit_positive = true;
+        } else if lowered == "!segwit" {
+            segwit_negated = true;
+        }
+    }
+
+    (segwit_positive && !segwit_negated, segwit_negated)
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcResponse<T> {
     result: Option<T>,
@@ -275,8 +291,14 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "missing".to_string());
                 let has_coinbasetxn = template.coinbase_txn_hex().is_some();
+                let (segwit_active, segwit_negated) = derive_segwit_flags(&template.rules);
+                let rules_for_log = if template.rules.is_empty() {
+                    "<missing>".to_string()
+                } else {
+                    template.rules.join(",")
+                };
                 println!(
-                    "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={} txs={} coinbasevalue={} has_coinbasetxn={}",
+                    "TEMPLATE job={} height={} prevhash={} bits={} curtime={} target={} txs={} coinbasevalue={} has_coinbasetxn={} rules={} segwit_active={} segwit_negated={}",
                     template_seq,
                     template.height,
                     template.previousblockhash,
@@ -285,7 +307,10 @@ pub async fn run_template_poller(shared_state: Arc<TemplatePollerState>) -> anyh
                     template.target,
                     template.transactions.len(),
                     coinbasevalue_for_log,
-                    has_coinbasetxn
+                    has_coinbasetxn,
+                    rules_for_log,
+                    segwit_active,
+                    segwit_negated
                 );
                 last_identity = Some((template.height, template.previousblockhash));
             }
@@ -377,8 +402,7 @@ fn build_getblocktemplate_request_body() -> Value {
         "id": "gateway_v1-gbt-poller",
         "method": "getblocktemplate",
         "params": [{
-            "rules": ["segwit"],
-            "capabilities": GBT_CAPABILITIES
+            "rules": ["segwit"]
         }]
     })
 }
@@ -431,6 +455,7 @@ mod tests {
                 "bits":"1d00ffff",
                 "curtime": 1710000000,
                 "target":"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "rules":["csv","!segwit","taproot"],
                 "coinbasevalue": 5000000000,
                 "coinbaseaux": { "flags": "062f503253482f" },
                 "default_witness_commitment": "6a24aa21a9ed1111111111111111111111111111111111111111111111111111111111111111",
@@ -460,6 +485,14 @@ mod tests {
         );
         assert!(template.default_witness_commitment.is_some());
         assert_eq!(template.transactions.len(), 1);
+        assert_eq!(
+            template.rules,
+            vec![
+                "csv".to_string(),
+                "!segwit".to_string(),
+                "taproot".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -472,6 +505,7 @@ mod tests {
                 "bits":"1d00ffff",
                 "curtime": 1710000001,
                 "target":"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                "rules":["csv","segwit"],
                 "coinbasevalue": 123,
                 "coinbaseaux": { "flags": "51" },
                 "default_witness_commitment": "6a24aa21a9ed2222222222222222222222222222222222222222222222222222222222222222",
@@ -484,10 +518,32 @@ mod tests {
         let snapshot = parse_template_response(body).expect("response should parse");
         let latest = LatestTemplate::from_snapshot(&snapshot);
         assert_eq!(latest.height, 101);
+        assert_eq!(latest.rules, vec!["csv".to_string(), "segwit".to_string()]);
+        assert!(latest.segwit_active);
         assert_eq!(latest.coinbase_value, Some(123));
         assert_eq!(latest.coinbase_aux_flags_hex.as_deref(), Some("51"));
         assert!(latest.default_witness_commitment_hex.is_some());
         assert_eq!(latest.coinbase_txn_hex.as_deref(), Some("0100000000"));
+    }
+
+    #[test]
+    fn segwit_active_false_when_rules_negate_segwit() {
+        let rules = vec![
+            "csv".to_string(),
+            "!segwit".to_string(),
+            "taproot".to_string(),
+        ];
+        let (segwit_active, segwit_negated) = derive_segwit_flags(&rules);
+        assert!(!segwit_active);
+        assert!(segwit_negated);
+    }
+
+    #[test]
+    fn segwit_active_true_when_rules_include_segwit_without_negation() {
+        let rules = vec!["csv".to_string(), "segwit".to_string()];
+        let (segwit_active, segwit_negated) = derive_segwit_flags(&rules);
+        assert!(segwit_active);
+        assert!(!segwit_negated);
     }
 
     #[test]
@@ -498,6 +554,7 @@ mod tests {
             bits: "1d00ffff".to_string(),
             curtime: 1,
             target: "ffff".to_string(),
+            rules: Vec::new(),
             version: default_template_version(),
             coinbasetxn: None,
             coinbase_payload: None,
@@ -535,19 +592,7 @@ mod tests {
     fn getblocktemplate_request_includes_segwit_rules_param() {
         let request = build_getblocktemplate_request_body();
         assert_eq!(request["method"], Value::from("getblocktemplate"));
-        assert_eq!(
-            request["params"],
-            json!([{
-                "rules": ["segwit"],
-                "capabilities": [
-                    "coinbasetxn",
-                    "workid",
-                    "coinbase/append",
-                    "longpoll",
-                    "proposal"
-                ]
-            }])
-        );
+        assert_eq!(request["params"], json!([{ "rules": ["segwit"] }]));
     }
 
     #[test]

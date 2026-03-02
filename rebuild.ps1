@@ -1,12 +1,12 @@
 git status
 git add -A
-git commit -m "v0.1.4: mask sensitive information"
+git commit -m "v0.1.4-rev1: segwit rules"
 
 # Vanilla release tag (this is what stable will point to)
-git tag v0.1.4 -m "v0.1.4"
+git tag v0.1.4-rev1 -m "v0.1.4-rev1"
 
 git push origin main
-git push origin v0.1.4
+git push origin v0.1.4-rev1 
 
 $SHA = (git rev-parse --short HEAD).Trim()
 

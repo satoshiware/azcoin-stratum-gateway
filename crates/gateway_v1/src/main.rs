@@ -40,6 +40,7 @@ struct GatewayState {
     shares_ok: AtomicU64,
     shares_rej: AtomicU64,
     shares_dup: AtomicU64,
+    share_rej_log_counter: AtomicU64,
     notify_real_total: AtomicU64,
     notify_fallback_total: AtomicU64,
     last_fallback_reason: Mutex<String>,
@@ -77,6 +78,7 @@ impl GatewayState {
             shares_ok: AtomicU64::new(0),
             shares_rej: AtomicU64::new(0),
             shares_dup: AtomicU64::new(0),
+            share_rej_log_counter: AtomicU64::new(0),
             notify_real_total: AtomicU64::new(0),
             notify_fallback_total: AtomicU64::new(0),
             last_fallback_reason: Mutex::new("none".to_string()),
@@ -162,6 +164,11 @@ impl GatewayState {
             self.notify_fallback_total.load(Ordering::Relaxed),
             last_reason,
         )
+    }
+
+    fn should_log_share_reject(&self) -> bool {
+        let current = self.share_rej_log_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        current == 1 || current % 100 == 0
     }
 
     fn allocate_or_reuse_job_id(&self, work_key: &str, force_clean_jobs: bool) -> (String, bool) {
@@ -1081,15 +1088,24 @@ where
         } => {
             state.record_rejected_share(duplicate);
             state.record_worker_share(&share.worker, false, share_diff, now);
+            let reason_for_event = reason.clone();
             emit_share_event(
                 state,
                 remote_addr,
                 &share,
                 false,
-                Some(reason),
+                Some(reason_for_event),
                 duplicate,
                 share_diff,
             );
+            if gateway_validate_shares_enabled() && state.should_log_share_reject() {
+                eprintln!(
+                    "SHARE_REJ reason={} job={} err=\"{}\"",
+                    share_reject_reason_token(&reason),
+                    share.job_id,
+                    compact_for_log(&reason)
+                );
+            }
             json!({
                 "id": request.id,
                 "result": false,
@@ -1352,10 +1368,10 @@ fn validate_submit_params_with_mode(
     let (meets_target, share_diff) =
         match validate_share_pow(&share, session_extranonce1, &job_template) {
             Ok(result) => result,
-            Err(_) => {
+            Err(error) => {
                 return submit_rejected(
                     share,
-                    "invalid_job_template",
+                    error.reason_code(),
                     false,
                     submit_error("invalid job data"),
                     0.0,
@@ -1386,6 +1402,18 @@ fn gateway_validate_shares_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn share_reject_reason_token(reason: &str) -> &'static str {
+    match reason {
+        "bad_ntime" => "BadNtime",
+        "bad_nonce" => "BadNonce",
+        "unknown_job" => "JobNotFound",
+        "coinbase_hash_mismatch" => "CoinbaseHashMismatch",
+        "merkle_mismatch" => "MerkleMismatch",
+        "low_difficulty_share" => "TargetMismatch",
+        _ => "InternalError",
+    }
 }
 
 fn partial_submit_fields(params: &Value) -> SubmitShare {
@@ -1446,15 +1474,36 @@ fn submit_rejected(
     }
 }
 
+#[derive(Debug, Clone)]
+enum SharePowError {
+    CoinbaseHashMismatch,
+    MerkleMismatch,
+    InternalError,
+}
+
+impl SharePowError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            SharePowError::CoinbaseHashMismatch => "coinbase_hash_mismatch",
+            SharePowError::MerkleMismatch => "merkle_mismatch",
+            SharePowError::InternalError => "internal_error",
+        }
+    }
+}
+
 fn validate_share_pow(
     share: &SubmitShare,
     session_extranonce1: &str,
     job_template: &JobTemplate,
-) -> Result<(bool, f64), String> {
-    let coinb1 = decode_hex(&job_template.coinb1)?;
-    let coinb2 = decode_hex(&job_template.coinb2)?;
-    let extranonce1 = decode_hex(session_extranonce1)?;
-    let extranonce2 = decode_hex(&share.extranonce2)?;
+) -> Result<(bool, f64), SharePowError> {
+    let coinb1 =
+        decode_hex(&job_template.coinb1).map_err(|_| SharePowError::CoinbaseHashMismatch)?;
+    let coinb2 =
+        decode_hex(&job_template.coinb2).map_err(|_| SharePowError::CoinbaseHashMismatch)?;
+    let extranonce1 =
+        decode_hex(session_extranonce1).map_err(|_| SharePowError::CoinbaseHashMismatch)?;
+    let extranonce2 =
+        decode_hex(&share.extranonce2).map_err(|_| SharePowError::CoinbaseHashMismatch)?;
     let mut coinbase =
         Vec::with_capacity(coinb1.len() + extranonce1.len() + extranonce2.len() + coinb2.len());
     coinbase.extend_from_slice(&coinb1);
@@ -1463,17 +1512,23 @@ fn validate_share_pow(
     coinbase.extend_from_slice(&coinb2);
     let coinbase_hash_be = sha256d_bytes(&coinbase);
 
-    let merkle_root_be = merkle_root_from_branch(coinbase_hash_be, &job_template.merkle_branch)?;
+    let merkle_root_be = merkle_root_from_branch(coinbase_hash_be, &job_template.merkle_branch)
+        .map_err(|_| SharePowError::MerkleMismatch)?;
 
-    let version = parse_u32_hex_exact(&job_template.version)?;
+    let version =
+        parse_u32_hex_exact(&job_template.version).map_err(|_| SharePowError::InternalError)?;
     if !share.version_bits.is_empty() {
-        let _ = parse_u32_hex_exact(&share.version_bits)?;
+        let _ =
+            parse_u32_hex_exact(&share.version_bits).map_err(|_| SharePowError::InternalError)?;
     }
-    let ntime = parse_u32_hex_exact(&share.ntime)?;
-    let nbits = parse_u32_hex_exact(&job_template.nbits)?;
-    let nonce = parse_u32_hex_exact(&share.nonce)?;
-    let prevhash_be = decode_hex_exact(&job_template.prevhash, 64)?;
-    let _job_ntime = parse_u32_hex_exact(&job_template.job_ntime)?;
+    let ntime = parse_u32_hex_exact(&share.ntime).map_err(|_| SharePowError::InternalError)?;
+    let nbits =
+        parse_u32_hex_exact(&job_template.nbits).map_err(|_| SharePowError::InternalError)?;
+    let nonce = parse_u32_hex_exact(&share.nonce).map_err(|_| SharePowError::InternalError)?;
+    let prevhash_be =
+        decode_hex_exact(&job_template.prevhash, 64).map_err(|_| SharePowError::InternalError)?;
+    let _job_ntime =
+        parse_u32_hex_exact(&job_template.job_ntime).map_err(|_| SharePowError::InternalError)?;
 
     let mut prevhash_le = [0u8; 32];
     prevhash_le.copy_from_slice(&prevhash_be);
@@ -1626,6 +1681,8 @@ struct NotifyBuildData {
     bits: String,
     curtime_hex: String,
     version: String,
+    segwit_active: bool,
+    has_witness_commitment: bool,
     coinb1: String,
     coinb2: String,
     merkle_branch: Vec<String>,
@@ -1637,6 +1694,7 @@ struct NotifyJobParts {
     coinb1: String,
     coinb2: String,
     merkle_branch: Vec<String>,
+    has_witness_commitment: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1723,14 +1781,16 @@ fn build_notify_push(
     } else {
         state.record_notify_real();
         println!(
-            "NOTIFY_REAL job={} height={} template_seq={} txs={} coinb1_len={} coinb2_len={} merkle_branches={}",
+            "NOTIFY_REAL job={} height={} template_seq={} txs={} coinb1_len={} coinb2_len={} merkle_branches={} segwit_active={} has_witness_commitment={}",
             job_id,
             height_for_log,
             template_seq,
             notify_data.tx_count,
             notify_data.coinb1.len(),
             notify_data.coinb2.len(),
-            notify_data.merkle_branch.len()
+            notify_data.merkle_branch.len(),
+            notify_data.segwit_active,
+            notify_data.has_witness_commitment
         );
     }
 
@@ -1776,6 +1836,8 @@ fn fallback_notify_data() -> NotifyBuildData {
         bits: "1d00ffff".to_string(),
         curtime_hex: "00000000".to_string(),
         version: "20000000".to_string(),
+        segwit_active: false,
+        has_witness_commitment: false,
         coinb1: String::new(),
         coinb2: String::new(),
         merkle_branch: Vec::new(),
@@ -1794,6 +1856,8 @@ fn fallback_notify_data_for_template(
         bits: template.bits.clone(),
         curtime_hex: format!("{:08x}", template.curtime),
         version: template.version.clone(),
+        segwit_active: template.segwit_active,
+        has_witness_commitment: false,
         coinb1: String::new(),
         coinb2: String::new(),
         merkle_branch: Vec::new(),
@@ -1828,6 +1892,8 @@ fn build_notify_data_from_template(
         bits: template.bits.clone(),
         curtime_hex: format!("{:08x}", template.curtime),
         version: template.version.clone(),
+        segwit_active: template.segwit_active,
+        has_witness_commitment: parts.has_witness_commitment,
         coinb1: parts.coinb1,
         coinb2: parts.coinb2,
         merkle_branch: parts.merkle_branch,
@@ -1845,6 +1911,16 @@ fn build_work_key_from_template(template: &LatestTemplate) -> String {
         template.version,
         template.coinbase_value.unwrap_or_default()
     );
+    material.push(':');
+    material.push_str(if template.segwit_active {
+        "segwit-on"
+    } else {
+        "segwit-off"
+    });
+    if !template.rules.is_empty() {
+        material.push(':');
+        material.push_str(&template.rules.join(","));
+    }
     if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
         material.push(':');
         material.push_str(coinbase_txn_hex);
@@ -1901,28 +1977,9 @@ fn build_real_notify_job_parts(
         )
     })?;
 
-    let (coinb1, coinb2) = if let Some(coinbase_txn_hex) = template.coinbase_txn_hex.as_deref() {
-        match split_coinbase_for_extranonce(
-            coinbase_txn_hex,
-            EXTRANONCE_1_SIZE,
-            EXTRANONCE_2_SIZE as usize,
-        ) {
-            Ok(parts) => parts,
-            Err(split_error) => build_coinbase_parts_from_template(template, coinbase_value)
-                .map_err(|fallback_error| {
-                    NotifyBuildError::new(
-                        NotifyFallbackReason::InternalError,
-                        format!(
-                            "coinbasetxn_split_failed=\"{}\" fallback_build_failed=\"{}\"",
-                            split_error, fallback_error
-                        ),
-                    )
-                })?,
-        }
-    } else {
+    let (coinb1, coinb2, has_witness_commitment) =
         build_coinbase_parts_from_template(template, coinbase_value)
-            .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::InternalError, error))?
-    };
+            .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::InternalError, error))?;
 
     let coinbase_hash_be = coinbase_hash_from_notify_parts(&coinb1, &coinb2)
         .map_err(|error| NotifyBuildError::new(NotifyFallbackReason::InternalError, error))?;
@@ -1935,13 +1992,14 @@ fn build_real_notify_job_parts(
         coinb1,
         coinb2,
         merkle_branch,
+        has_witness_commitment,
     })
 }
 
 fn build_coinbase_parts_from_template(
     template: &LatestTemplate,
     coinbase_value: u64,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, bool), String> {
     let mut script_sig_prefix = serialize_bip34_height_push(template.height)?;
     if let Some(flags_hex) = template.coinbase_aux_flags_hex.as_deref() {
         if let Ok(flags) = decode_hex(flags_hex) {
@@ -1966,13 +2024,18 @@ fn build_coinbase_parts_from_template(
     coinb1.extend_from_slice(&script_sig_prefix);
 
     let payout_script = default_coinbase_payout_script();
-    let witness_commitment_script = template
-        .default_witness_commitment_hex
-        .as_deref()
-        .and_then(|hex| decode_hex(hex).ok())
-        .filter(|script| !script.is_empty());
+    let witness_commitment_script = if template.segwit_active {
+        template
+            .default_witness_commitment_hex
+            .as_deref()
+            .and_then(|hex| decode_hex(hex).ok())
+            .filter(|script| !script.is_empty())
+    } else {
+        None
+    };
+    let has_witness_commitment = witness_commitment_script.is_some();
     let mut output_count = 1usize;
-    if witness_commitment_script.is_some() {
+    if has_witness_commitment {
         output_count += 1;
     }
 
@@ -1989,7 +2052,11 @@ fn build_coinbase_parts_from_template(
     }
     coinb2.extend_from_slice(&0u32.to_le_bytes());
 
-    Ok((bytes_to_lower_hex(&coinb1), bytes_to_lower_hex(&coinb2)))
+    Ok((
+        bytes_to_lower_hex(&coinb1),
+        bytes_to_lower_hex(&coinb2),
+        has_witness_commitment,
+    ))
 }
 
 fn serialize_bip34_height_push(height: u64) -> Result<Vec<u8>, String> {
@@ -2028,6 +2095,7 @@ fn coinbase_hash_from_notify_parts(coinb1_hex: &str, coinb2_hex: &str) -> Result
     Ok(sha256d_bytes(&coinbase))
 }
 
+#[allow(dead_code)]
 fn split_coinbase_for_extranonce(
     coinbase_tx_hex: &str,
     extranonce1_size: usize,
@@ -2399,6 +2467,8 @@ mod tests {
             bits: "1d00ffff".to_string(),
             curtime: 1710000000,
             version: "20000000".to_string(),
+            rules: vec!["csv".to_string(), "segwit".to_string()],
+            segwit_active: true,
             coinbase_txn_hex: Some(sample_coinbase_tx_hex().to_string()),
             coinbase_value: Some(5_000_000_000),
             coinbase_aux_flags_hex: Some("062f503253482f".to_string()),
@@ -2416,6 +2486,8 @@ mod tests {
             bits: "1d00ffff".to_string(),
             curtime: 1710000000,
             version: "20000000".to_string(),
+            rules: vec!["csv".to_string(), "segwit".to_string()],
+            segwit_active: true,
             coinbase_txn_hex: None,
             coinbase_value: Some(5_000_000_000),
             coinbase_aux_flags_hex: Some("062f503253482f".to_string()),
@@ -2958,6 +3030,44 @@ mod tests {
         let serialized_hex = bytes_to_lower_hex(&coinbase);
         assert!(!serialized_hex.is_empty());
         assert_eq!(serialized_hex.len() % 2, 0);
+    }
+
+    #[test]
+    fn coinbase_builder_skips_witness_commitment_when_segwit_inactive() {
+        let mut template = sample_latest_template_without_coinbasetxn();
+        template.rules = vec!["csv".to_string(), "!segwit".to_string()];
+        template.segwit_active = false;
+        template.default_witness_commitment_hex = Some(
+            "6a24aa21a9ed1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+        );
+
+        let parts = build_real_notify_job_parts(&template).expect("coinbase parts should build");
+        assert!(!parts.has_witness_commitment);
+
+        let coinb2 = decode_hex(&parts.coinb2).expect("coinb2 should decode");
+        let mut cursor = 4usize; // sequence
+        let output_count = read_varint(&coinb2, &mut cursor).expect("output count should parse");
+        assert_eq!(output_count, 1);
+    }
+
+    #[test]
+    fn coinbase_builder_includes_witness_commitment_when_segwit_active() {
+        let mut template = sample_latest_template_without_coinbasetxn();
+        template.rules = vec!["csv".to_string(), "segwit".to_string()];
+        template.segwit_active = true;
+        template.default_witness_commitment_hex = Some(
+            "6a24aa21a9ed2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+        );
+
+        let parts = build_real_notify_job_parts(&template).expect("coinbase parts should build");
+        assert!(parts.has_witness_commitment);
+
+        let coinb2 = decode_hex(&parts.coinb2).expect("coinb2 should decode");
+        let mut cursor = 4usize; // sequence
+        let output_count = read_varint(&coinb2, &mut cursor).expect("output count should parse");
+        assert_eq!(output_count, 2);
     }
 
     #[test]
